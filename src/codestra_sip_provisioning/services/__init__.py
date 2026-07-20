@@ -1,8 +1,3 @@
-from .durable import (
-    AssignmentService, AuditService, CredentialService, IdempotencyService,
-    SessionService,
-)
-from ..state.guards import LockManager, RateLimitService, ReplayGuard
+from .lifecycle import DurableSessionService, LifecycleError
 
-__all__ = ["AssignmentService", "AuditService", "CredentialService", "IdempotencyService",
-           "RateLimitService", "ReplayGuard", "SessionService", "LockManager"]
+__all__ = ["DurableSessionService", "LifecycleError"]

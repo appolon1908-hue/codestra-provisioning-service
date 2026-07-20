@@ -2,24 +2,28 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
-class CreateSessionRequest(BaseModel):
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class CreateSessionRequest(StrictModel):
     ttl_seconds: int = Field(default=600, ge=300, le=1800)
 
 
-class RenewSessionRequest(BaseModel):
+class RenewSessionRequest(StrictModel):
     session_id: UUID
     ttl_seconds: int = Field(default=600, ge=300, le=1800)
 
 
-class RevokeSessionRequest(BaseModel):
+class RevokeSessionRequest(StrictModel):
     session_id: UUID
     reason: str = Field(min_length=1, max_length=120)
 
 
-class SessionResponse(BaseModel):
+class SessionResponse(StrictModel):
     session_id: UUID
     endpoint: str
     sip_username: str

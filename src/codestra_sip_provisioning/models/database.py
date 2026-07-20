@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, UniqueConstraint
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -12,9 +14,10 @@ class Base(DeclarativeBase):
 
 class SipEndpointAssignment(Base):
     __tablename__ = "sip_endpoint_assignments"
+    __table_args__ = (UniqueConstraint("user_subject", name="uq_assignment_subject"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_subject: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
-    endpoint_name: Mapped[str] = mapped_column(String(80), unique=True, nullable=False)
+    user_subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    endpoint_name: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
@@ -36,11 +39,11 @@ class SipSession(Base):
 class SipAuditEvent(Base):
     __tablename__ = "sip_audit_events"
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    event_type: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(80), nullable=False)
     actor_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     request_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    metadata_json: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
@@ -53,9 +56,9 @@ class SipIdempotencyRecord(Base):
     key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
-    safe_response: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict)
+    safe_response: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     status_code: Mapped[int] = mapped_column(Integer, nullable=False)
-    completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
