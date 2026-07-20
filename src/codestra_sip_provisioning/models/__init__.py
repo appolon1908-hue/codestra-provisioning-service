@@ -1,3 +1,12 @@
-from .database import Base, SipAuditEvent, SipEndpointAssignment, SipIdempotencyRecord, SipSession
+from .database import (
+    Base,
+    SipAuditEvent,
+    SipCredentialRotation,
+    SipEndpointAssignment,
+    SipIdempotencyRecord,
+    SipSchemaState,
+    SipSession,
+)
 
-__all__ = ["Base", "SipAuditEvent", "SipEndpointAssignment", "SipIdempotencyRecord", "SipSession"]
+__all__ = ["Base", "SipAuditEvent", "SipCredentialRotation", "SipEndpointAssignment",
+           "SipIdempotencyRecord", "SipSchemaState", "SipSession"]
