@@ -1,0 +1,16 @@
+from dataclasses import dataclass
+from typing import Protocol
+
+
+@dataclass(frozen=True)
+class IssuedCredential:
+    username: str
+    password: str
+
+
+class Provisioner(Protocol):
+    async def issue(self, endpoint: str) -> IssuedCredential: ...
+    async def rotate(self, endpoint: str) -> IssuedCredential: ...
+    async def revoke(self, endpoint: str) -> None: ...
+    async def validate(self, endpoint: str) -> bool: ...
+    def describe_capabilities(self) -> dict[str, object]: ...

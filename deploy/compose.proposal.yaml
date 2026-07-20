@@ -1,0 +1,11 @@
+services:
+  sip-provisioning:
+    build: {context: /opt/codestra/sip-provisioning, dockerfile: deploy/Dockerfile}
+    image: codestra/sip-provisioning:0.1.0
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    network_mode: none
+    expose: [8110]
+    restart: unless-stopped
+    # Proposal only; not included in the active compose stack.

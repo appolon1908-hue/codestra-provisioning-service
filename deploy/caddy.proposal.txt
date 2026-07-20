@@ -1,0 +1,6 @@
+# Proposal only; do not activate in the current task.
+api.codestra.agency {
+    handle_path /api/v1/sip/* {
+        reverse_proxy sip-provisioning:8110
+    }
+}

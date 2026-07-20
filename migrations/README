@@ -1,0 +1,3 @@
+Production migrations are intentionally not activated in the mock-only phase.
+The SQLAlchemy models in src/codestra_sip_provisioning/models/database.py are
+the reviewed durable schema proposal.

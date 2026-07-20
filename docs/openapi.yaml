@@ -1,0 +1,12 @@
+openapi: 3.1.0
+info: {title: Codestra SIP Provisioning API, version: 0.1.0}
+servers: [{url: https://api.codestra.agency}]
+paths:
+  /healthz: {get: {responses: {'200': {description: liveness}}}}
+  /readyz: {get: {responses: {'200': {description: ready}, '503': {description: unavailable}}}}
+  /api/v1/sip/config: {get: {responses: {'200': {description: non-secret policy}}}}
+  /api/v1/sip/session:
+    post: {description: Mock session create; credentials are memory-only and never logged, requestBody: {required: true}, responses: {'200': {description: session}, '400': {description: invalid}, '409': {description: conflict}}}
+    delete: {description: Idempotent revoke, responses: {'204': {description: revoked}}}
+  /api/v1/sip/session/renew:
+    post: {description: Rotate mock credential, responses: {'200': {description: rotated}, '404': {description: missing}}}
