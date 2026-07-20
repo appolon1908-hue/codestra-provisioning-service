@@ -3,10 +3,12 @@ from typing import Any, cast
 
 from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import text
 
+from .auth.policy import AuthorizationDenied, AuthorizationPolicy
 from .auth.principal import Principal
-from .auth.provider import PrincipalProvider
+from .auth.provider import AuthenticationError, PrincipalProvider, build_principal_provider
 from .config import Settings, get_settings
 from .dependencies import build_service
 from .schemas.sessions import (
@@ -34,11 +36,15 @@ def problem(exc: LifecycleError) -> JSONResponse:
 
 
 def create_app(
-    settings: Settings | None = None, service: DurableSessionService | None = None
+    settings: Settings | None = None,
+    service: DurableSessionService | None = None,
+    principal_provider: PrincipalProvider | None = None,
 ) -> FastAPI:
     cfg = settings or get_settings()
     configured = service or build_service(cfg)[0]
-    provider = PrincipalProvider(cfg)
+    provider = principal_provider or build_principal_provider(cfg)
+    policy = AuthorizationPolicy()
+    bearer = HTTPBearer(auto_error=False, description="Trusted JWT/OIDC access token")
     api = FastAPI(
         title="Codestra SIP Provisioning API",
         version=cfg.service_version,
@@ -133,8 +139,62 @@ def create_app(
             },
         }
 
-    async def principal(authorization: str | None = Header(default=None)) -> Principal:
-        return await provider.authenticate(authorization)
+    async def principal(
+        request: Request,
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer),  # noqa: B008
+    ) -> Principal:
+        decision_id = uuid.uuid4()
+        try:
+            authorization = (
+                f"{credentials.scheme} {credentials.credentials}" if credentials else None
+            )
+            identity = await provider.authenticate(request, authorization)
+            await configured.audit_authorization(
+                subject=identity.subject,
+                role=identity.primary_role,
+                action="authentication",
+                result="allowed",
+                reason="verified_principal",
+                request_id=decision_id,
+            )
+            return identity
+        except AuthenticationError as exc:
+            await configured.audit_authorization(
+                subject=None,
+                role=None,
+                action="authentication",
+                result="denied",
+                reason=exc.code,
+                request_id=decision_id,
+            )
+            raise LifecycleError(exc.status, exc.code, exc.detail) from exc
+
+    async def authorize(
+        identity: Principal,
+        operation: str,
+        owner: Any | None = None,
+    ) -> None:
+        decision_id = uuid.uuid4()
+        try:
+            await policy.authorize(identity, operation, owner=owner)
+        except AuthorizationDenied as exc:
+            await configured.audit_authorization(
+                subject=identity.subject,
+                role=identity.primary_role,
+                action=f"authorize:{operation}",
+                result="denied",
+                reason=exc.code,
+                request_id=decision_id,
+            )
+            raise LifecycleError(403, exc.code, exc.detail) from exc
+        await configured.audit_authorization(
+            subject=identity.subject,
+            role=identity.primary_role,
+            action=f"authorize:{operation}",
+            result="allowed",
+            reason="policy_allowed",
+            request_id=decision_id,
+        )
 
     def ids(correlation: str | None) -> tuple[uuid.UUID, uuid.UUID]:
         request_id = uuid.uuid4()
@@ -153,6 +213,7 @@ def create_app(
         client_id: str = Header(min_length=1, alias="X-Client-Instance-ID"),
         correlation: str | None = Header(default=None, alias="X-Correlation-ID"),
     ) -> dict[str, Any]:
+        await authorize(identity, "create")
         request_id, correlation_id = ids(correlation)
         return await configured.create(
             identity.subject,
@@ -171,6 +232,11 @@ def create_app(
         client_id: str = Header(min_length=1, alias="X-Client-Instance-ID"),
         correlation: str | None = Header(default=None, alias="X-Correlation-ID"),
     ) -> dict[str, Any]:
+        await authorize(
+            identity,
+            "renew",
+            owner=lambda: configured.owns_session(identity.subject, payload.session_id),
+        )
         request_id, correlation_id = ids(correlation)
         return await configured.renew(
             identity.subject,
@@ -190,6 +256,11 @@ def create_app(
         client_id: str = Header(min_length=1, alias="X-Client-Instance-ID"),
         correlation: str | None = Header(default=None, alias="X-Correlation-ID"),
     ) -> Response:
+        await authorize(
+            identity,
+            "revoke",
+            owner=lambda: configured.owns_session(identity.subject, payload.session_id),
+        )
         del client_id
         request_id, correlation_id = ids(correlation)
         await configured.revoke(

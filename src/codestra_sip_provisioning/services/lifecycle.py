@@ -112,6 +112,7 @@ class DurableSessionService:
         request_id: uuid.UUID | None,
         correlation_id: uuid.UUID | None,
         metadata: dict[str, object],
+        actor_role: str | None = "sip_session_user",
     ) -> None:
         await db.execute(text("SELECT pg_advisory_xact_lock(81254021)"))
         previous = (
@@ -143,7 +144,7 @@ class DurableSessionService:
             SipAuditEvent(
                 occurred_at=datetime.now(UTC),
                 actor_subject_hash=subject_hash,
-                actor_role="sip_session_user",
+                actor_role=actor_role,
                 action=action,
                 result=result,
                 session_id=session_id,
@@ -156,6 +157,44 @@ class DurableSessionService:
                 event_hash=event_hash,
             )
         )
+
+    async def audit_authorization(
+        self,
+        *,
+        subject: str | None,
+        role: str | None,
+        action: str,
+        result: str,
+        reason: str,
+        request_id: uuid.UUID,
+    ) -> None:
+        subject_hash = (
+            self.digest(subject, "codestra:sip:subject:v1") if subject is not None else None
+        )
+        async with self.sessions() as db, db.begin():
+            await self._audit(
+                db,
+                action=action,
+                result=result,
+                subject_hash=subject_hash,
+                session_id=None,
+                assignment_id=None,
+                request_id=request_id,
+                correlation_id=request_id,
+                metadata={"reason_code": reason},
+                actor_role=role,
+            )
+
+    async def owns_session(self, subject: str, session_id: uuid.UUID) -> bool:
+        subject_hash = self.digest(subject, "codestra:sip:subject:v1")
+        async with self.sessions() as db:
+            return (
+                await db.execute(
+                    select(SipSession.id).where(
+                        SipSession.id == session_id, SipSession.subject_hash == subject_hash
+                    )
+                )
+            ).scalar_one_or_none() is not None
 
     async def create(
         self,

@@ -1,8 +1,50 @@
 from functools import lru_cache
 from typing import Literal, Self
 
-from pydantic import Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+ROLES = frozenset(
+    {
+        "agent",
+        "closer",
+        "supervisor",
+        "manager",
+        "compliance_auditor",
+        "platform_admin",
+        "service_vicidial",
+        "service_n8n",
+        "service_sip",
+    }
+)
+SCOPES = frozenset(
+    {
+        "crm:read",
+        "crm:write",
+        "calls:read",
+        "calls:disposition",
+        "callbacks:create",
+        "callbacks:update",
+        "transfer:request",
+        "transfer:approve",
+        "compliance:write",
+        "ai:recommendation:read",
+        "ai:recommendation:accept",
+        "sip:session:create",
+        "sip:session:renew",
+        "sip:session:revoke",
+        "supervisor:monitor",
+        "supervisor:whisper",
+        "supervisor:barge",
+        "audit:read",
+    }
+)
+
+
+class MTLSPrincipalDefinition(BaseModel):
+    subject: str = Field(min_length=1, max_length=255)
+    roles: frozenset[str]
+    scopes: frozenset[str]
 
 
 class Settings(BaseSettings):
@@ -13,7 +55,18 @@ class Settings(BaseSettings):
     service_version: str = "0.2.0"
     listen_host: str = "0.0.0.0"  # noqa: S104 - container-internal listener
     listen_port: int = 8110
-    auth_mode: Literal["test", "disabled_trusted"] = "disabled_trusted"
+    auth_mode: Literal["test", "jwt", "mtls", "disabled_trusted"] = "disabled_trusted"
+    jwt_issuer: str | None = None
+    jwt_audience: str | None = None
+    jwt_jwks_url: str | None = None
+    jwt_pinned_public_key: str | None = None
+    jwt_allowed_algorithms: frozenset[str] = frozenset()
+    jwt_token_type_claim: str = "token_type"  # noqa: S105 - public JWT claim name
+    jwt_expected_token_type: str = "access"  # noqa: S105 - public token classification
+    jwt_clock_skew_seconds: int = Field(default=30, ge=0, le=120)
+    jwt_role_claim: str = "roles"
+    jwt_scope_claim: str = "scope"
+    mtls_principals: dict[str, MTLSPrincipalDefinition] = Field(default_factory=dict)
 
     database_url: str
     redis_url: str
@@ -47,10 +100,60 @@ class Settings(BaseSettings):
     mock_wss_url: str = "wss://mock.invalid/ws"
     mock_realm: str = "mock.invalid"
 
+    @property
+    def allowed_roles(self) -> frozenset[str]:
+        return ROLES
+
+    @property
+    def allowed_scopes(self) -> frozenset[str]:
+        return SCOPES
+
+    @field_validator("jwt_allowed_algorithms", mode="before")
+    @classmethod
+    def parse_algorithms(cls, value: object) -> object:
+        if isinstance(value, str):
+            return frozenset(item.strip() for item in value.split(",") if item.strip())
+        return value
+
     @model_validator(mode="after")
     def fail_closed(self) -> Self:
         if self.auth_mode == "test" and self.app_env != "test":
             raise ValueError("test authentication is allowed only in APP_ENV=test")
+        if self.auth_mode == "jwt":
+            if not self.jwt_issuer or not self.jwt_audience:
+                raise ValueError("JWT issuer and audience are required")
+            if not self.jwt_issuer.startswith("https://"):
+                raise ValueError("JWT issuer must use HTTPS")
+            if self.jwt_jwks_url and not self.jwt_jwks_url.startswith("https://"):
+                raise ValueError("JWKS URL must use HTTPS")
+            if bool(self.jwt_jwks_url) == bool(self.jwt_pinned_public_key):
+                raise ValueError("configure exactly one JWT verification key source")
+            if not self.jwt_allowed_algorithms or "none" in {
+                item.lower() for item in self.jwt_allowed_algorithms
+            }:
+                raise ValueError("explicit signed JWT algorithms are required")
+            if not self.jwt_allowed_algorithms <= {
+                "RS256",
+                "RS384",
+                "RS512",
+                "ES256",
+                "ES384",
+                "ES512",
+            }:
+                raise ValueError("only asymmetric JWT algorithms are allowed")
+        if self.auth_mode == "mtls":
+            if not self.mtls_principals:
+                raise ValueError("mTLS principal allowlist is required")
+            for fingerprint, definition in self.mtls_principals.items():
+                if len(fingerprint) != 64 or any(
+                    character not in "0123456789abcdef" for character in fingerprint
+                ):
+                    raise ValueError("mTLS fingerprints must be lowercase SHA-256")
+                if not definition.roles <= ROLES or not definition.scopes <= SCOPES:
+                    raise ValueError("mTLS authority contains unknown role or scope")
+        trusted = self.auth_mode in {"jwt", "mtls"}
+        if self.live_authorization_enabled != trusted:
+            raise ValueError("LIVE_AUTHORIZATION_ENABLED must exactly match trusted auth mode")
         if self.public_session_route_enabled and not self.live_authorization_enabled:
             raise ValueError("public sessions require approved trusted authentication")
         if any(

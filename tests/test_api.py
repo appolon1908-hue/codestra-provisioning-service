@@ -19,6 +19,8 @@ os.environ["AUDIT_HMAC_KEY"] = base64.urlsafe_b64encode(os.urandom(48)).decode()
 os.environ["SUBJECT_HASH_KEY"] = base64.urlsafe_b64encode(os.urandom(48)).decode()
 os.environ["CREDENTIAL_FINGERPRINT_KEY"] = base64.urlsafe_b64encode(os.urandom(48)).decode()
 
+from codestra_sip_provisioning.auth.principal import Principal, PrincipalKind
+from codestra_sip_provisioning.auth.provider import TestPrincipalProvider as PrincipalTestProvider
 from codestra_sip_provisioning.config import Settings
 from codestra_sip_provisioning.main import create_app
 from codestra_sip_provisioning.models import SipAuditEvent, SipEndpointAssignment, SipSession
@@ -192,3 +194,43 @@ async def test_api_contract_and_auth_gate(durable: DurableSessionService) -> Non
         assert durable.settings.public_session_route_enabled is False
         committed = json.loads(Path("docs/openapi.yaml").read_text(encoding="utf-8"))
         assert app.openapi() == committed
+
+        no_scope = Principal(
+            "scope-denied-agent",
+            frozenset({"agent"}),
+            frozenset(),
+            PrincipalKind.TEST,
+            "test",
+        )
+        denied_app = create_app(
+            durable.settings,
+            durable,
+            PrincipalTestProvider(durable.settings, {"no-scope-token": no_scope}),
+        )
+        denied_transport = httpx.ASGITransport(app=denied_app)
+        async with httpx.AsyncClient(
+            transport=denied_transport, base_url="http://test"
+        ) as denied_client:
+            denied_scope = await denied_client.post(
+                "/api/v1/sip/session",
+                json={},
+                headers={
+                    "Authorization": "Bearer no-scope-token",
+                    "Idempotency-Key": "scope-denial-key",
+                    "X-Client-Instance-ID": "scope-denial-browser",
+                },
+            )
+            assert denied_scope.status_code == 403
+        async with durable.sessions() as db:
+            decisions = (
+                await db.execute(
+                    select(SipAuditEvent).where(
+                        SipAuditEvent.action.in_(("authentication", "authorize:create"))
+                    )
+                )
+            ).scalars()
+            assert {(event.action, event.result) for event in decisions} >= {
+                ("authentication", "allowed"),
+                ("authorize:create", "allowed"),
+                ("authorize:create", "denied"),
+            }
