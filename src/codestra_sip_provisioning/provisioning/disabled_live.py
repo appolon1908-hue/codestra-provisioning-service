@@ -1,5 +1,5 @@
-from .base import IssuedCredential
 from ..errors import DisabledFeatureError
+from .base import IssuedCredential
 
 
 class DisabledLiveProvisioner:

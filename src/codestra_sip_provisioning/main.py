@@ -1,89 +1,203 @@
-"""Application factory for the durable, mock-only SIP API."""
-from __future__ import annotations
-
 import uuid
-from typing import Any
+from typing import Any, cast
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, Request, Response
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
-from .auth.mock import Identity, mock_identity
+from .auth.principal import Principal
+from .auth.provider import PrincipalProvider
 from .config import Settings, get_settings
 from .dependencies import build_service
+from .schemas.sessions import (
+    CreateSessionRequest,
+    RenewSessionRequest,
+    RevokeSessionRequest,
+    SessionResponse,
+)
 from .services.lifecycle import DurableSessionService, LifecycleError
-from .schemas.sessions import CreateSessionRequest, RenewSessionRequest, RevokeSessionRequest
 
 
-def create_app(settings: Settings | None = None, service: DurableSessionService | None = None) -> FastAPI:
-    configured = service
-    if configured is None:
-        configured, engine, redis = build_service(settings or get_settings())
-    app = FastAPI(title="Codestra SIP Provisioning API", version=(settings or get_settings()).service_version)
-    app.state.durable_service = configured
+def problem(exc: LifecycleError) -> JSONResponse:
+    body: dict[str, object] = {
+        "type": f"urn:codestra:sip:{exc.code}",
+        "title": exc.code.replace("_", " "),
+        "status": exc.status,
+        "detail": exc.detail,
+    }
+    if exc.reference:
+        body["session_id"] = str(exc.reference)
+    response = JSONResponse(body, status_code=exc.status, media_type="application/problem+json")
+    if exc.status == 429:
+        response.headers["Retry-After"] = "60"
+    return response
 
-    @app.middleware("http")
-    async def no_store(request: Request, call_next: Any) -> Response:
-        result = await call_next(request)
-        result.headers["Cache-Control"] = "no-store"
-        result.headers["Pragma"] = "no-cache"
-        return result
 
-    def svc() -> DurableSessionService:
-        return app.state.durable_service
+def create_app(
+    settings: Settings | None = None, service: DurableSessionService | None = None
+) -> FastAPI:
+    cfg = settings or get_settings()
+    configured = service or build_service(cfg)[0]
+    provider = PrincipalProvider(cfg)
+    api = FastAPI(
+        title="Codestra SIP Provisioning API",
+        version=cfg.service_version,
+        openapi_version="3.1.0",
+        docs_url=None,
+        redoc_url=None,
+    )
 
-    @app.get("/healthz")
-    async def healthz() -> dict[str, str]: return {"status": "ok"}
+    @api.middleware("http")
+    async def safeguards(request: Request, call_next: Any) -> Response:
+        size = request.headers.get("content-length")
+        if size and int(size) > cfg.max_request_bytes:
+            return JSONResponse(
+                {
+                    "type": "urn:codestra:sip:request_too_large",
+                    "title": "request too large",
+                    "status": 413,
+                    "detail": "request body exceeds limit",
+                },
+                status_code=413,
+                media_type="application/problem+json",
+            )
+        response = cast(Response, await call_next(request))
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        return response
 
-    @app.get("/readyz")
-    async def readyz() -> dict[str, Any]:
-        s = svc().settings
-        if not s.sip_provisioning_mock_mode or s.endpoint_6101_allowed or s.live_asterisk_provisioning_enabled:
-            raise HTTPException(503, "mock safety gate failed")
+    @api.exception_handler(LifecycleError)
+    async def lifecycle_error(_: Request, exc: LifecycleError) -> JSONResponse:
+        return problem(exc)
+
+    @api.get("/healthz")
+    async def healthz() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @api.get("/readyz")
+    async def readyz() -> Response:
+        checks = {
+            "mock_provisioner": configured.provisioner.__class__.__name__ == "MockProvisioner",
+            "mock_mode": cfg.sip_provisioning_mock_mode,
+            "live_flags_off": not any(
+                (
+                    cfg.live_asterisk_provisioning_enabled,
+                    cfg.live_endpoint_install_enabled,
+                    cfg.live_endpoint_reload_enabled,
+                    cfg.live_endpoint_delete_enabled,
+                    cfg.endpoint_6101_allowed,
+                )
+            ),
+            "encryption_key": configured.cipher.active_version
+            == cfg.credential_encryption_key_version,
+            "public_auth_gate": not cfg.public_session_route_enabled
+            or cfg.live_authorization_enabled,
+        }
         try:
-            async with svc().sessions() as db:
-                await db.execute(__import__("sqlalchemy").text("SELECT 1"))
-            await svc().redis.ping()
-        except Exception as exc:
-            raise HTTPException(503, "durable dependencies unavailable") from exc
-        return {"status": "ready", "postgres": "ok", "redis": "ok", "mock_provisioner": True,
-                "live_provisioning": False, "endpoint_6101_allowed": False,
-                "migration_revision": s.migration_revision}
+            async with configured.sessions() as db:
+                checks["postgres"] = bool((await db.execute(text("SELECT 1"))).scalar_one())
+                revision = (
+                    await db.execute(text("SELECT version_num FROM alembic_version"))
+                ).scalar_one()
+                schema = (
+                    await db.execute(text("SELECT schema_version FROM schema_state WHERE id=1"))
+                ).scalar_one()
+                checks["migrations"] = revision == cfg.migration_revision
+                checks["schema_state"] = schema == cfg.schema_version
+        except Exception:
+            checks["postgres"] = checks["migrations"] = checks["schema_state"] = False
+        try:
+            checks["redis"] = bool(await configured.redis.ping())
+        except Exception:
+            checks["redis"] = False
+        status = 200 if all(checks.values()) else 503
+        return JSONResponse(
+            {"status": "ready" if status == 200 else "not_ready", "checks": checks},
+            status_code=status,
+        )
 
-    @app.get("/api/v1/sip/config")
-    async def config() -> dict[str, Any]:
-        s = svc().settings
-        return {"service_version": s.service_version, "mock_mode": True,
-                "ttl_limits": {"min": s.session_ttl_min_seconds, "default": s.session_ttl_default_seconds, "max": s.session_ttl_max_seconds},
-                "renewal_supported": True, "one_user_one_endpoint": True,
-                "supported_transports": ["WSS"], "supported_codecs": ["opus", "PCMU"],
-                "wss_url": s.mock_wss_url, "realm": s.mock_realm,
-                "endpoint_6101_available": False, "live_provisioning_enabled": False}
+    @api.get("/api/v1/sip/config")
+    async def sip_config() -> dict[str, object]:
+        return {
+            "service_version": cfg.service_version,
+            "mock_mode": True,
+            "public_session_route_enabled": cfg.public_session_route_enabled,
+            "live_provisioning_enabled": False,
+            "endpoint_6101_available": False,
+            "credential_storage": "memory-only",
+            "one_user_one_endpoint": True,
+            "ttl_limits": {
+                "min": cfg.session_ttl_min_seconds,
+                "default": cfg.session_ttl_default_seconds,
+                "max": cfg.session_ttl_max_seconds,
+            },
+        }
 
-    async def call(operation: Any, *args: Any) -> Any:
-        try: return await operation(*args)
-        except LifecycleError as exc: raise HTTPException(exc.status, exc.detail) from exc
+    async def principal(authorization: str | None = Header(default=None)) -> Principal:
+        return await provider.authenticate(authorization)
 
-    @app.post("/api/v1/sip/session")
-    async def create(payload: CreateSessionRequest, request: Request, identity: Identity = Depends(mock_identity), idempotency_key: str | None = Header(None, alias="Idempotency-Key"), x_client_instance_id: str | None = Header(None, alias="X-Client-Instance-ID"), x_correlation_id: str | None = Header(None, alias="X-Correlation-ID")) -> Any:
-        if not idempotency_key or not x_client_instance_id: raise HTTPException(400, "Idempotency-Key and X-Client-Instance-ID are required")
-        rid, corr = uuid.uuid4(), uuid.UUID(x_correlation_id) if x_correlation_id else uuid.uuid4()
-        return await call(svc().create, identity.subject, x_client_instance_id, idempotency_key, payload.ttl_seconds, rid, corr)
+    def ids(correlation: str | None) -> tuple[uuid.UUID, uuid.UUID]:
+        request_id = uuid.uuid4()
+        try:
+            return request_id, uuid.UUID(correlation) if correlation else request_id
+        except ValueError as exc:
+            raise LifecycleError(
+                400, "invalid_correlation_id", "X-Correlation-ID must be a UUID"
+            ) from exc
 
-    @app.post("/api/v1/sip/session/renew")
-    async def renew(payload: RenewSessionRequest, identity: Identity = Depends(mock_identity), idempotency_key: str | None = Header(None, alias="Idempotency-Key"), x_client_instance_id: str | None = Header(None, alias="X-Client-Instance-ID"), x_correlation_id: str | None = Header(None, alias="X-Correlation-ID")) -> Any:
-        if not idempotency_key or not x_client_instance_id: raise HTTPException(400, "Idempotency-Key and X-Client-Instance-ID are required")
-        return await call(svc().renew, identity.subject, payload.session_id, x_client_instance_id, idempotency_key, payload.ttl_seconds, uuid.uuid4(), uuid.UUID(x_correlation_id) if x_correlation_id else uuid.uuid4())
+    @api.post("/api/v1/sip/session", response_model=SessionResponse, status_code=201)
+    async def create(
+        payload: CreateSessionRequest,
+        identity: Principal = Depends(principal),  # noqa: B008 - FastAPI dependency
+        idempotency_key: str = Header(min_length=8, alias="Idempotency-Key"),
+        client_id: str = Header(min_length=1, alias="X-Client-Instance-ID"),
+        correlation: str | None = Header(default=None, alias="X-Correlation-ID"),
+    ) -> dict[str, Any]:
+        request_id, correlation_id = ids(correlation)
+        return await configured.create(
+            identity.subject,
+            client_id,
+            idempotency_key,
+            payload.ttl_seconds,
+            request_id,
+            correlation_id,
+        )
 
-    @app.delete("/api/v1/sip/session", status_code=204)
-    async def revoke(payload: RevokeSessionRequest, identity: Identity = Depends(mock_identity), idempotency_key: str | None = Header(None, alias="Idempotency-Key"), x_client_instance_id: str | None = Header(None, alias="X-Client-Instance-ID")) -> Response:
-        if not idempotency_key or not x_client_instance_id: raise HTTPException(400, "Idempotency-Key and X-Client-Instance-ID are required")
-        await call(svc().revoke, identity.subject, payload.session_id, idempotency_key, uuid.uuid4(), uuid.uuid4())
+    @api.post("/api/v1/sip/session/renew", response_model=SessionResponse)
+    async def renew(
+        payload: RenewSessionRequest,
+        identity: Principal = Depends(principal),  # noqa: B008 - FastAPI dependency
+        idempotency_key: str = Header(min_length=8, alias="Idempotency-Key"),
+        client_id: str = Header(min_length=1, alias="X-Client-Instance-ID"),
+        correlation: str | None = Header(default=None, alias="X-Correlation-ID"),
+    ) -> dict[str, Any]:
+        request_id, correlation_id = ids(correlation)
+        return await configured.renew(
+            identity.subject,
+            payload.session_id,
+            client_id,
+            idempotency_key,
+            payload.ttl_seconds,
+            request_id,
+            correlation_id,
+        )
+
+    @api.delete("/api/v1/sip/session", status_code=204)
+    async def revoke(
+        payload: RevokeSessionRequest,
+        identity: Principal = Depends(principal),  # noqa: B008 - FastAPI dependency
+        idempotency_key: str = Header(min_length=8, alias="Idempotency-Key"),
+        client_id: str = Header(min_length=1, alias="X-Client-Instance-ID"),
+        correlation: str | None = Header(default=None, alias="X-Correlation-ID"),
+    ) -> Response:
+        del client_id
+        request_id, correlation_id = ids(correlation)
+        await configured.revoke(
+            identity.subject, payload.session_id, idempotency_key, request_id, correlation_id
+        )
         return Response(status_code=204)
 
-    return app
+    return api
 
 
-try:
-    app = create_app()
-except Exception:
-    # Import remains safe in tooling; deployment must provide validated settings.
-    app = FastAPI(title="Codestra SIP Provisioning API")
+app = create_app()

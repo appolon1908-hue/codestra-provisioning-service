@@ -14,7 +14,7 @@ def redact(value: Any, key: str = "") -> Any:
         return "[REDACTED]"
     if isinstance(value, Mapping):
         return {str(k): redact(v, str(k)) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [redact(item) for item in value]
     if isinstance(value, BaseException):
         return {"type": type(value).__name__, "message": "[REDACTED_EXCEPTION]"}

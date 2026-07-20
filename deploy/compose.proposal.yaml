@@ -1,11 +1,26 @@
 services:
   sip-provisioning:
-    build: {context: /opt/codestra/sip-provisioning, dockerfile: deploy/Dockerfile}
-    image: codestra/sip-provisioning:0.1.0
+    image: codestra/sip-provisioning:0.2.0-durable
+    restart: unless-stopped
+    env_file: [/opt/codestra/env/sip-provisioning.env]
+    networks: [backend]
+    expose: ['8110']
     read_only: true
+    tmpfs: [/tmp:size=16m,mode=1777]
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    network_mode: none
-    expose: [8110]
-    restart: unless-stopped
-    # Proposal only; not included in the active compose stack.
+    user: '10001:10001'
+    pids_limit: 128
+    cpus: 1
+    mem_limit: 512m
+    healthcheck:
+      test: [CMD, python, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8110/healthz", timeout=2)']
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    logging: {driver: json-file, options: {max-size: 10m, max-file: '5'}}
+
+networks:
+  backend:
+    external: true
+    name: codestra_backend

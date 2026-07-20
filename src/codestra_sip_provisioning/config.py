@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     app_env: Literal["test", "preproduction", "production"]
     service_name: str = "codestra-sip-provisioning"
     service_version: str = "0.2.0"
-    listen_host: str = "0.0.0.0"
+    listen_host: str = "0.0.0.0"  # noqa: S104 - container-internal listener
     listen_port: int = 8110
     auth_mode: Literal["test", "disabled_trusted"] = "disabled_trusted"
 
@@ -53,16 +53,27 @@ class Settings(BaseSettings):
             raise ValueError("test authentication is allowed only in APP_ENV=test")
         if self.public_session_route_enabled and not self.live_authorization_enabled:
             raise ValueError("public sessions require approved trusted authentication")
-        if any((self.live_asterisk_provisioning_enabled, self.live_endpoint_install_enabled,
-                self.live_endpoint_reload_enabled, self.live_endpoint_delete_enabled,
-                self.endpoint_6101_allowed)):
+        if any(
+            (
+                self.live_asterisk_provisioning_enabled,
+                self.live_endpoint_install_enabled,
+                self.live_endpoint_reload_enabled,
+                self.live_endpoint_delete_enabled,
+                self.endpoint_6101_allowed,
+            )
+        ):
             raise ValueError("live provisioning and endpoint 6101 are forbidden")
         if not self.sip_provisioning_mock_mode:
             raise ValueError("MockProvisioner must remain active")
         if self.credential_encryption_key_version != "v1":
             raise ValueError("configured encryption key version is unavailable")
-        if not (300 <= self.session_ttl_min_seconds <= self.session_ttl_default_seconds
-                <= self.session_ttl_max_seconds <= 1800):
+        if not (
+            300
+            <= self.session_ttl_min_seconds
+            <= self.session_ttl_default_seconds
+            <= self.session_ttl_max_seconds
+            <= 1800
+        ):
             raise ValueError("invalid TTL policy")
         if not 0 <= self.credential_overlap_seconds <= 15:
             raise ValueError("invalid credential overlap")
@@ -71,4 +82,4 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()  # type: ignore[call-arg]
+    return Settings()

@@ -1,0 +1,31 @@
+services:
+  postgres-test:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_DB: sip_test
+      POSTGRES_USER: sip_test
+      POSTGRES_PASSWORD: ${SIP_TEST_DB_PASSWORD:?runtime test password required}
+    networks: [testdata]
+    healthcheck: {test: [CMD-SHELL, 'pg_isready -U sip_test'], interval: 2s, timeout: 2s, retries: 20}
+  redis-test:
+    image: redis:7.4.5-alpine
+    command: [redis-server, --appendonly, 'no', --save, '']
+    networks: [testdata]
+    healthcheck: {test: [CMD, redis-cli, ping], interval: 2s, timeout: 2s, retries: 20}
+  test-runner:
+    image: codestra/sip-provisioning:0.2.0-durable
+    entrypoint: []
+    working_dir: /work
+    user: '0:0'
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sip_test:${SIP_TEST_DB_PASSWORD}@postgres-test:5432/sip_test
+      REDIS_URL: redis://redis-test:6379/15
+      PYTHONPATH: /work/src
+    volumes: ['..:/work']
+    networks: [testdata]
+    depends_on:
+      postgres-test: {condition: service_healthy}
+      redis-test: {condition: service_healthy}
+    profiles: [tools]
+networks:
+  testdata: {internal: true}

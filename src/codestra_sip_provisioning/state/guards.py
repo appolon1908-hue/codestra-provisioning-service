@@ -8,17 +8,33 @@ from .redis_keys import RedisKeyspace
 
 
 class RedisLike(Protocol):
-    async def set(self, name: str, value: str, *, ex: int | None = None,
-                  px: int | None = None, nx: bool = False) -> object: ...
+    async def set(
+        self,
+        name: str,
+        value: str,
+        *,
+        ex: int | None = None,
+        px: int | None = None,
+        nx: bool = False,
+    ) -> object: ...
     async def eval(self, script: str, numkeys: int, *args: str) -> object: ...
     async def incr(self, name: str) -> int: ...
     async def expire(self, name: str, seconds: int) -> object: ...
     async def ttl(self, name: str) -> int: ...
 
 
-RELEASE = "if redis.call('get',KEYS[1])==ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end"
-EXTEND = "if redis.call('get',KEYS[1])==ARGV[1] then return redis.call('pexpire',KEYS[1],ARGV[2]) else return 0 end"
-INCR_TTL = "local n=redis.call('incr',KEYS[1]); if n==1 then redis.call('expire',KEYS[1],ARGV[1]) end; return {n,redis.call('ttl',KEYS[1])}"
+RELEASE = (
+    "if redis.call('get',KEYS[1])==ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end"
+)
+EXTEND = (
+    "if redis.call('get',KEYS[1])==ARGV[1] then "
+    "return redis.call('pexpire',KEYS[1],ARGV[2]) else return 0 end"
+)
+INCR_TTL = (
+    "local n=redis.call('incr',KEYS[1]); "
+    "if n==1 then redis.call('expire',KEYS[1],ARGV[1]) end; "
+    "return {n,redis.call('ttl',KEYS[1])}"
+)
 
 
 @dataclass(frozen=True)
@@ -31,7 +47,9 @@ class LockManager:
     def __init__(self, redis: RedisLike, keys: RedisKeyspace, ttl_seconds: int = 20) -> None:
         self.redis, self.keys, self.ttl_seconds = redis, keys, ttl_seconds
 
-    async def acquire(self, subject_hash: str, operation: str, wait_seconds: float = 2.0) -> LockToken:
+    async def acquire(
+        self, subject_hash: str, operation: str, wait_seconds: float = 2.0
+    ) -> LockToken:
         key, owner = self.keys.lock(subject_hash, operation), str(uuid.uuid4())
         deadline = asyncio.get_running_loop().time() + wait_seconds
         while not await self.redis.set(key, owner, px=self.ttl_seconds * 1000, nx=True):
@@ -44,7 +62,9 @@ class LockManager:
         return bool(await self.redis.eval(RELEASE, 1, token.key, token.owner))
 
     async def extend(self, token: LockToken) -> bool:
-        return bool(await self.redis.eval(EXTEND, 1, token.key, token.owner, str(self.ttl_seconds * 1000)))
+        return bool(
+            await self.redis.eval(EXTEND, 1, token.key, token.owner, str(self.ttl_seconds * 1000))
+        )
 
 
 class ReplayGuard:
@@ -52,7 +72,9 @@ class ReplayGuard:
         self.redis, self.keys, self.ttl_seconds = redis, keys, ttl_seconds
 
     async def claim(self, nonce_hash: str) -> bool:
-        return bool(await self.redis.set(self.keys.replay(nonce_hash), "1", ex=self.ttl_seconds, nx=True))
+        return bool(
+            await self.redis.set(self.keys.replay(nonce_hash), "1", ex=self.ttl_seconds, nx=True)
+        )
 
 
 class RateLimitService:

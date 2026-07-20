@@ -28,18 +28,33 @@ class CredentialCipher:
     def aad(service: str, session_id: str, subject_hash: str, endpoint: str, version: str) -> bytes:
         return f"{service}|{session_id}|{subject_hash}|{endpoint}|{version}".encode()
 
-    def encrypt(self, credential: str, session_id: str, subject_hash: str,
-                endpoint: str, expires_at: datetime) -> str:
+    def encrypt(
+        self,
+        credential: str,
+        session_id: str,
+        subject_hash: str,
+        endpoint: str,
+        expires_at: datetime,
+    ) -> str:
         nonce = os.urandom(12)
         version = self.active_version
         ciphertext = AESGCM(self._keys[version]).encrypt(
-            nonce, credential.encode(), self.aad(self.service_name, session_id, subject_hash, endpoint, version)
+            nonce,
+            credential.encode(),
+            self.aad(self.service_name, session_id, subject_hash, endpoint, version),
         )
-        return json.dumps({"algorithm": "AES-256-GCM", "key_version": version,
-                           "nonce": base64.b64encode(nonce).decode(),
-                           "ciphertext": base64.b64encode(ciphertext).decode(),
-                           "issued_at": datetime.now(UTC).isoformat(),
-                           "expires_at": expires_at.isoformat()}, separators=(",", ":"), sort_keys=True)
+        return json.dumps(
+            {
+                "algorithm": "AES-256-GCM",
+                "key_version": version,
+                "nonce": base64.b64encode(nonce).decode(),
+                "ciphertext": base64.b64encode(ciphertext).decode(),
+                "issued_at": datetime.now(UTC).isoformat(),
+                "expires_at": expires_at.isoformat(),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
 
     def decrypt(self, envelope: str, session_id: str, subject_hash: str, endpoint: str) -> str:
         data = json.loads(envelope)
@@ -47,7 +62,9 @@ class CredentialCipher:
         key = self._keys.get(version)
         if key is None or datetime.fromisoformat(data["expires_at"]) <= datetime.now(UTC):
             raise ValueError("credential envelope is unavailable")
-        clear = AESGCM(key).decrypt(base64.b64decode(data["nonce"]),
-                                    base64.b64decode(data["ciphertext"]),
-                                    self.aad(self.service_name, session_id, subject_hash, endpoint, version))
+        clear = AESGCM(key).decrypt(
+            base64.b64decode(data["nonce"]),
+            base64.b64decode(data["ciphertext"]),
+            self.aad(self.service_name, session_id, subject_hash, endpoint, version),
+        )
         return clear.decode()

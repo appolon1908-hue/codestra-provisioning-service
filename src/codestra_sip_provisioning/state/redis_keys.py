@@ -41,7 +41,10 @@ class RedisKeyspace:
         return f"{self.namespace}:replay:{self._hash(nonce_hash)}"
 
     def ratelimit(self, subject_hash: str, route: str, window: str) -> str:
-        return f"{self.namespace}:ratelimit:{self._hash(subject_hash)}:{self._safe(route)}:{self._safe(window)}"
+        return (
+            f"{self.namespace}:ratelimit:{self._hash(subject_hash)}:"
+            f"{self._safe(route)}:{self._safe(window)}"
+        )
 
     def endpoint(self, endpoint_name: str) -> str:
         if not re.fullmatch(r"mock-[0-9a-f]{12}", endpoint_name):

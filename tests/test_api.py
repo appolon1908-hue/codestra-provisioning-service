@@ -1,36 +1,194 @@
-from fastapi.testclient import TestClient
+import asyncio
+import base64
+import json
+import os
+import uuid
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
-from codestra_sip_provisioning.main import app, store
+import httpx
+import pytest
+from redis.asyncio import Redis
+from sqlalchemy import func, select, text, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+os.environ["APP_ENV"] = "test"
+os.environ["AUTH_MODE"] = "test"
+os.environ["CREDENTIAL_ENCRYPTION_KEY_V1"] = base64.urlsafe_b64encode(os.urandom(32)).decode()
+os.environ["AUDIT_HMAC_KEY"] = base64.urlsafe_b64encode(os.urandom(48)).decode()
+os.environ["SUBJECT_HASH_KEY"] = base64.urlsafe_b64encode(os.urandom(48)).decode()
+os.environ["CREDENTIAL_FINGERPRINT_KEY"] = base64.urlsafe_b64encode(os.urandom(48)).decode()
 
-def setup_function() -> None:
-    store.assignments.clear(); store.sessions.clear(); store.idempotency.clear()
-
-
-def headers(key: str = "k1") -> dict[str, str]:
-    return {"X-Test-Subject": "user-1", "X-Client-Instance-ID": "browser-1", "Idempotency-Key": key}
-
-
-def test_health_and_config() -> None:
-    client = TestClient(app)
-    assert client.get("/healthz").status_code == 200
-    assert client.get("/api/v1/sip/config").json()["live_provisioning_enabled"] is False
-
-
-def test_create_replay_renew_revoke() -> None:
-    client = TestClient(app)
-    created = client.post("/api/v1/sip/session", headers=headers(), json={}).json()
-    assert created["mock_mode"] is True and created["endpoint"].startswith("mock-")
-    replay = client.post("/api/v1/sip/session", headers=headers(), json={})
-    assert replay.status_code == 200 and replay.json()["session_id"] == created["session_id"]
-    renewed = client.post("/api/v1/sip/session/renew", headers=headers("renew"), json={"session_id": created["session_id"]})
-    assert renewed.status_code == 200 and renewed.json()["credential_rotated"] is True
-    assert client.request("DELETE", "/api/v1/sip/session", headers={"X-Test-Subject": "user-1"}, json={"session_id": created["session_id"], "reason": "logout"}).status_code == 204
-    assert client.request("DELETE", "/api/v1/sip/session", headers={"X-Test-Subject": "user-1"}, json={"session_id": created["session_id"], "reason": "logout"}).status_code == 204
+from codestra_sip_provisioning.config import Settings
+from codestra_sip_provisioning.main import create_app
+from codestra_sip_provisioning.models import SipAuditEvent, SipEndpointAssignment, SipSession
+from codestra_sip_provisioning.services.lifecycle import DurableSessionService, LifecycleError
+from codestra_sip_provisioning.state.crypto import CredentialCipher
 
 
-def test_required_headers_and_one_active_session() -> None:
-    client = TestClient(app)
-    assert client.post("/api/v1/sip/session", headers={"X-Test-Subject": "user-1"}, json={}).status_code == 400
-    assert client.post("/api/v1/sip/session", headers=headers(), json={}).status_code == 200
-    assert client.post("/api/v1/sip/session", headers=headers("k2"), json={}).status_code == 409
+def settings() -> Settings:
+    key = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+    secret = base64.urlsafe_b64encode(os.urandom(48)).decode()
+    return Settings(
+        app_env="test",
+        auth_mode="test",
+        database_url=os.environ["DATABASE_URL"],
+        redis_url=os.environ["REDIS_URL"],
+        credential_encryption_key_v1=key,
+        audit_hmac_key=secret,
+        subject_hash_key=secret,
+        credential_fingerprint_key=secret,
+    )
+
+
+def service(cfg: Settings) -> DurableSessionService:
+    engine = create_async_engine(cfg.database_url, pool_pre_ping=True)
+    sessions = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    redis = Redis.from_url(cfg.redis_url, decode_responses=True)
+    raw_key = base64.urlsafe_b64decode(cfg.credential_encryption_key_v1 + "===")
+    cipher = CredentialCipher({"v1": raw_key}, "v1", cfg.service_name)
+    return DurableSessionService(sessions, redis, cfg, cipher)
+
+
+@pytest.fixture
+async def durable() -> DurableSessionService:
+    cfg = settings()
+    instance = service(cfg)
+    async with instance.sessions() as db, db.begin():
+        await db.execute(
+            text(
+                "TRUNCATE credential_rotation,idempotency_record,audit_event,"
+                "sip_session,endpoint_assignment RESTART IDENTITY CASCADE"
+            )
+        )
+    await instance.redis.flushdb()
+    yield instance
+    await instance.redis.aclose()
+    await instance.sessions.kw["bind"].dispose()
+
+
+async def create(
+    instance: DurableSessionService, key: str = "create-key-0001"
+) -> dict[str, object]:
+    request_id = uuid.uuid4()
+    return await instance.create(
+        "agent@example.invalid", "browser-a", key, 600, request_id, request_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_restart_multiple_workers_and_one_time_credential(
+    durable: DurableSessionService,
+) -> None:
+    created = await create(durable)
+    password = str(created["sip_password"])
+    worker_b = service(durable.settings)
+    try:
+        with pytest.raises(LifecycleError) as replay:
+            await create(worker_b)
+        assert replay.value.code == "credential_already_delivered"
+        assert replay.value.reference == uuid.UUID(str(created["session_id"]))
+        async with worker_b.sessions() as db:
+            assert await db.scalar(select(func.count()).select_from(SipEndpointAssignment)) == 1
+            assert await db.scalar(select(func.count()).select_from(SipSession)) == 1
+            assert await db.scalar(select(func.count()).select_from(SipAuditEvent)) == 1
+            row = (await db.execute(select(SipSession))).scalar_one()
+            assert row.credential_fingerprint != password
+        envelope = await worker_b.redis.get(worker_b.keys.credential(str(created["session_id"])))
+        assert envelope is not None and password not in envelope
+        assert json.loads(envelope)["algorithm"] == "AES-256-GCM"
+    finally:
+        await worker_b.redis.aclose()
+        await worker_b.sessions.kw["bind"].dispose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_create_one_assignment_and_session(durable: DurableSessionService) -> None:
+    results = await asyncio.gather(
+        create(durable, "concurrent-key-a"),
+        create(durable, "concurrent-key-b"),
+        return_exceptions=True,
+    )
+    assert sum(isinstance(item, dict) for item in results) == 1
+    assert sum(isinstance(item, LifecycleError) for item in results) == 1
+    async with durable.sessions() as db:
+        assert await db.scalar(select(func.count()).select_from(SipEndpointAssignment)) == 1
+        assert await db.scalar(select(func.count()).select_from(SipSession)) == 1
+
+
+@pytest.mark.asyncio
+async def test_idempotency_payload_conflict(durable: DurableSessionService) -> None:
+    await create(durable, "payload-key-001")
+    with pytest.raises(LifecycleError) as conflict:
+        rid = uuid.uuid4()
+        await durable.create("agent@example.invalid", "browser-a", "payload-key-001", 601, rid, rid)
+    assert conflict.value.status == 409
+    assert conflict.value.code == "idempotency_conflict"
+
+
+@pytest.mark.asyncio
+async def test_all_redis_keys_have_ttl_and_revoke_deletes_credential(
+    durable: DurableSessionService,
+) -> None:
+    created = await create(durable, "ttl-create-key")
+    keys = await durable.redis.keys(f"{durable.settings.redis_namespace}:*")
+    assert keys
+    for key in keys:
+        assert await durable.redis.ttl(key) > 0
+    sid = uuid.UUID(str(created["session_id"]))
+    rid = uuid.uuid4()
+    await durable.revoke("agent@example.invalid", sid, "revoke-key-0001", rid, rid)
+    assert await durable.redis.exists(durable.keys.credential(str(sid))) == 0
+    async with durable.sessions() as db:
+        assert (await db.get(SipSession, sid)).state == "revoked"
+
+
+@pytest.mark.asyncio
+async def test_expiration_reconciliation_preserves_assignment(
+    durable: DurableSessionService,
+) -> None:
+    created = await create(durable, "expire-key-0001")
+    sid = uuid.UUID(str(created["session_id"]))
+    async with durable.sessions() as db, db.begin():
+        await db.execute(
+            update(SipSession)
+            .where(SipSession.id == sid)
+            .values(expires_at=datetime.now(UTC) - timedelta(seconds=1))
+        )
+    assert await durable.reconcile() == 1
+    async with durable.sessions() as db:
+        assert (await db.get(SipSession, sid)).state == "expired"
+        assert await db.scalar(select(func.count()).select_from(SipEndpointAssignment)) == 1
+        events = (
+            (await db.execute(select(SipAuditEvent).order_by(SipAuditEvent.occurred_at)))
+            .scalars()
+            .all()
+        )
+        assert events[-1].action == "expire"
+        for previous, current in zip(events, events[1:], strict=False):
+            assert current.previous_hash == previous.event_hash
+
+
+@pytest.mark.asyncio
+async def test_api_contract_and_auth_gate(durable: DurableSessionService) -> None:
+    app = create_app(durable.settings, durable)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        assert (await client.get("/healthz")).status_code == 200
+        denied = await client.post("/api/v1/sip/session", json={})
+        assert denied.status_code == 422 or denied.status_code == 401
+        response = await client.post(
+            "/api/v1/sip/session",
+            json={},
+            headers={
+                "Authorization": "Bearer test:api-agent",
+                "Idempotency-Key": "api-create-0001",
+                "X-Client-Instance-ID": "browser-api",
+            },
+        )
+        assert response.status_code == 201
+        assert response.headers["cache-control"] == "no-store"
+        assert response.json()["mock_mode"] is True
+        assert durable.settings.public_session_route_enabled is False
+        committed = json.loads(Path("docs/openapi.yaml").read_text(encoding="utf-8"))
+        assert app.openapi() == committed
