@@ -1,0 +1,53 @@
+services:
+  postgres-validation:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_DB: sip_validation
+      POSTGRES_USER: sip_validation
+      POSTGRES_PASSWORD: validation-only-postgres
+    volumes:
+      - validation-postgres:/var/lib/postgresql/data
+    networks: [validation]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U sip_validation -d sip_validation]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  redis-validation:
+    image: redis:7.4.5-alpine
+    command: [redis-server, --appendonly, 'no', --save, '']
+    volumes:
+      - validation-redis:/data
+    networks: [validation]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  test-runner:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.validation
+    entrypoint: []
+    working_dir: /work
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sip_validation:validation-only-postgres@postgres-validation:5432/sip_validation
+      REDIS_URL: redis://redis-validation:6379/15
+      PYTHONPATH: /work/src
+      APP_ENV: test
+      AUTH_MODE: test
+      CREDENTIAL_ENCRYPTION_KEY_V1: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=
+      AUDIT_HMAC_KEY: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw
+      SUBJECT_HASH_KEY: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw
+      CREDENTIAL_FINGERPRINT_KEY: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw
+    networks: [validation]
+    depends_on:
+      postgres-validation: {condition: service_healthy}
+      redis-validation: {condition: service_healthy}
+    profiles: [tools]
+networks:
+  validation:
+    internal: true
+volumes:
+  validation-postgres:
+  validation-redis:

@@ -1,0 +1,16 @@
+FROM python:3.12.11-slim-bookworm
+ENV PYTHONPATH=/work/src PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /work
+COPY lockfile /tmp/lockfile
+RUN python -m pip install --no-cache-dir --upgrade pip==26.1.2 \
+    && pip install --no-cache-dir --requirement /tmp/lockfile \
+    && pip install --no-cache-dir \
+       pytest==9.1.1 pytest-asyncio==1.4.0 pytest-cov==6.2.1 \
+       ruff==0.12.9 mypy==1.17.1 pip-audit==2.9.0
+COPY pyproject.toml /work/pyproject.toml
+COPY alembic.ini /work/alembic.ini
+COPY src /work/src
+COPY migrations /work/migrations
+COPY tests /work/tests
+COPY docs /work/docs
+COPY scripts /work/scripts
