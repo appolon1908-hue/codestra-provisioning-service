@@ -4,7 +4,7 @@ services:
     environment:
       POSTGRES_DB: sip_validation
       POSTGRES_USER: sip_validation
-      POSTGRES_PASSWORD: validation-only-postgres
+      POSTGRES_PASSWORD: ${SIP_VALIDATION_DB_PASSWORD:?runtime validation password required}
     volumes:
       - validation-postgres:/var/lib/postgresql/data
     networks: [validation]
@@ -31,15 +31,15 @@ services:
     entrypoint: []
     working_dir: /work
     environment:
-      DATABASE_URL: postgresql+asyncpg://sip_validation:validation-only-postgres@postgres-validation:5432/sip_validation
+      DATABASE_URL: postgresql+asyncpg://sip_validation:${SIP_VALIDATION_DB_PASSWORD}@postgres-validation:5432/sip_validation
       REDIS_URL: redis://redis-validation:6379/15
       PYTHONPATH: /work/src
       APP_ENV: test
       AUTH_MODE: test
-      CREDENTIAL_ENCRYPTION_KEY_V1: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=
-      AUDIT_HMAC_KEY: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw
-      SUBJECT_HASH_KEY: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw
-      CREDENTIAL_FINGERPRINT_KEY: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw
+      CREDENTIAL_ENCRYPTION_KEY_V1: ${SIP_VALIDATION_ENCRYPTION_KEY:?runtime validation key required}
+      AUDIT_HMAC_KEY: ${SIP_VALIDATION_AUDIT_KEY:?runtime validation key required}
+      SUBJECT_HASH_KEY: ${SIP_VALIDATION_SUBJECT_KEY:?runtime validation key required}
+      CREDENTIAL_FINGERPRINT_KEY: ${SIP_VALIDATION_FINGERPRINT_KEY:?runtime validation key required}
     networks: [validation]
     depends_on:
       postgres-validation: {condition: service_healthy}

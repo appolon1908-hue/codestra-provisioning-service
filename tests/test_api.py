@@ -23,9 +23,16 @@ from codestra_sip_provisioning.auth.principal import Principal, PrincipalKind
 from codestra_sip_provisioning.auth.provider import TestPrincipalProvider as PrincipalTestProvider
 from codestra_sip_provisioning.config import Settings
 from codestra_sip_provisioning.main import create_app
-from codestra_sip_provisioning.models import SipAuditEvent, SipEndpointAssignment, SipSession
+from codestra_sip_provisioning.models import (
+    SipAuditEvent,
+    SipCredentialRotation,
+    SipEndpointAssignment,
+    SipSession,
+)
+from codestra_sip_provisioning.security.redaction import redact
 from codestra_sip_provisioning.services.lifecycle import DurableSessionService, LifecycleError
 from codestra_sip_provisioning.state.crypto import CredentialCipher
+from codestra_sip_provisioning.state.guards import ReplayGuard
 
 
 def settings() -> Settings:
@@ -146,6 +153,68 @@ async def test_all_redis_keys_have_ttl_and_revoke_deletes_credential(
 
 
 @pytest.mark.asyncio
+async def test_renew_rotates_once_and_never_persists_plaintext(
+    durable: DurableSessionService,
+) -> None:
+    created = await create(durable, "renew-create-key")
+    sid = uuid.UUID(str(created["session_id"]))
+    original_password = str(created["sip_password"])
+    request_id = uuid.uuid4()
+
+    renewed = await durable.renew(
+        "agent@example.invalid",
+        sid,
+        "browser-a",
+        "renew-key-0001",
+        600,
+        request_id,
+        request_id,
+    )
+    rotated_password = str(renewed["sip_password"])
+    assert renewed["credential_rotated"] is True
+    assert rotated_password != original_password
+
+    with pytest.raises(LifecycleError) as replay:
+        await durable.renew(
+            "agent@example.invalid",
+            sid,
+            "browser-a",
+            "renew-key-0001",
+            600,
+            uuid.uuid4(),
+            uuid.uuid4(),
+        )
+    assert replay.value.code == "credential_already_delivered"
+
+    async with durable.sessions() as db:
+        row = await db.get(SipSession, sid)
+        assert row is not None
+        assert row.state == "renewed"
+        assert row.renewal_count == 1
+        assert row.credential_fingerprint not in {original_password, rotated_password}
+        assert await db.scalar(select(func.count()).select_from(SipCredentialRotation)) == 1
+        persisted = await db.scalar(
+            text("SELECT row_to_json(sip_session)::text FROM sip_session WHERE id=:id"),
+            {"id": sid},
+        )
+        assert original_password not in str(persisted)
+        assert rotated_password not in str(persisted)
+
+    envelope = await durable.redis.get(durable.keys.credential(str(sid)))
+    previous = await durable.redis.get(durable.keys.old_credential(str(sid)))
+    assert envelope is not None and rotated_password not in envelope
+    assert previous is not None and original_password not in previous
+    subject_hash = durable.digest("agent@example.invalid", "codestra:sip:subject:v1")
+    assert durable.cipher.decrypt(
+        envelope,
+        str(sid),
+        subject_hash,
+        str(renewed["endpoint"]),
+    ) == rotated_password
+    assert await durable.redis.ttl(durable.keys.old_credential(str(sid))) > 0
+
+
+@pytest.mark.asyncio
 async def test_expiration_reconciliation_preserves_assignment(
     durable: DurableSessionService,
 ) -> None:
@@ -234,3 +303,62 @@ async def test_api_contract_and_auth_gate(durable: DurableSessionService) -> Non
                 ("authorize:create", "allowed"),
                 ("authorize:create", "denied"),
             }
+
+
+@pytest.mark.asyncio
+async def test_readiness_config_and_request_limit_fail_closed(
+    durable: DurableSessionService,
+) -> None:
+    app = create_app(durable.settings, durable)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        ready = await client.get("/readyz")
+        assert ready.status_code == 200
+        assert ready.json()["status"] == "ready"
+        assert all(ready.json()["checks"].values())
+
+        config = await client.get("/api/v1/sip/config")
+        assert config.status_code == 200
+        assert config.json()["public_session_route_enabled"] is False
+        assert config.json()["endpoint_6101_available"] is False
+        assert config.json()["live_provisioning_enabled"] is False
+
+        oversized = await client.post(
+            "/api/v1/sip/session",
+            content=b"{}",
+            headers={"Content-Length": str(durable.settings.max_request_bytes + 1)},
+        )
+        assert oversized.status_code == 413
+        assert oversized.json()["status"] == 413
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_replay_guard_and_recursive_redaction(
+    durable: DurableSessionService,
+) -> None:
+    await create(durable, "rate-key-0000")
+    for index in range(1, 5):
+        with pytest.raises(LifecycleError) as active:
+            await create(durable, f"rate-key-{index:04d}")
+        assert active.value.code == "active_session_exists"
+    with pytest.raises(LifecycleError) as limited:
+        await create(durable, "rate-key-0005")
+    assert limited.value.status == 429
+    assert limited.value.code == "rate_limited"
+
+    nonce_hash = durable.digest("one-time-nonce", "codestra:sip:replay:v1")
+    replay = ReplayGuard(durable.redis, durable.keys)
+    assert await replay.claim(nonce_hash) is True
+    assert await replay.claim(nonce_hash) is False
+    assert await durable.redis.ttl(durable.keys.replay(nonce_hash)) > 0
+
+    clean = redact(
+        {
+            "password": "never-log-me",
+            "nested": {"authorization": "Bearer never-log-me"},
+            "url": "https://example.invalid/callback?token=never-log-me",
+        }
+    )
+    rendered = json.dumps(clean)
+    assert "never-log-me" not in rendered
+    assert rendered.count("[REDACTED]") == 3

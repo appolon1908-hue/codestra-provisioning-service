@@ -6,6 +6,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     UniqueConstraint,
@@ -40,7 +41,15 @@ class SipEndpointAssignment(Base):
 
 class SipSession(Base):
     __tablename__ = "sip_session"
-    __table_args__ = (CheckConstraint("renewal_count >= 0", name="ck_renewal_nonnegative"),)
+    __table_args__ = (
+        CheckConstraint("renewal_count >= 0", name="ck_renewal_nonnegative"),
+        Index(
+            "uq_one_active_session_per_subject",
+            "subject_hash",
+            unique=True,
+            postgresql_where=text("state IN ('issued','active','renewing','renewed')"),
+        ),
+    )
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     assignment_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("endpoint_assignment.id"), nullable=False
@@ -69,6 +78,7 @@ class SipSession(Base):
 
 class SipAuditEvent(Base):
     __tablename__ = "audit_event"
+    __table_args__ = (Index("ix_audit_event_occurred_at", "occurred_at"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     actor_subject_hash: Mapped[str | None] = mapped_column(String(64))
