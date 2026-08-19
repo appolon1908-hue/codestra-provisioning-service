@@ -374,6 +374,7 @@ class ProvisioningEngine:
             lock = self._locks.setdefault(request_id, asyncio.Lock())
             async with lock:
                 self.repository.cancel_pending(request_id)
+                self.repository.mark_cancelled(request_id)
                 await self._compensate(request_id)
                 result = self.repository.request_result(request_id)
                 if not result:

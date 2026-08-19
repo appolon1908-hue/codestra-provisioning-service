@@ -56,6 +56,7 @@ class StateRepository:
               request_hash TEXT NOT NULL,
               state TEXT NOT NULL,
               result_json TEXT,
+              cancelled_at TEXT,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
@@ -184,6 +185,12 @@ class StateRepository:
                 self._connection.execute(
                     f"ALTER TABLE compensation_actions ADD COLUMN {name} {definition}"
                 )
+        execution_columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(executions)").fetchall()
+        }
+        if "cancelled_at" not in execution_columns:
+            self._connection.execute("ALTER TABLE executions ADD COLUMN cancelled_at TEXT")
 
     def transition_mock_mailbox(
         self,
@@ -819,16 +826,26 @@ class StateRepository:
         with self._lock:
             rows = self._connection.execute(
                 """SELECT DISTINCT ca.request_id FROM compensation_actions ca
+                   JOIN executions e ON e.request_id=ca.request_id
                    WHERE ca.state='failed' AND ca.attempt_count<ca.max_attempts
                      AND (ca.next_retry_at IS NULL OR ca.next_retry_at<=?)
-                     AND EXISTS (
-                       SELECT 1 FROM steps s WHERE s.request_id=ca.request_id
-                         AND s.state='dead_letter'
+                     AND (
+                       e.cancelled_at IS NOT NULL OR EXISTS (
+                         SELECT 1 FROM steps s WHERE s.request_id=ca.request_id
+                           AND s.state='dead_letter'
+                       )
                      )
                    ORDER BY ca.request_id""",
                 (iso(),),
             ).fetchall()
             return [row["request_id"] for row in rows]
+
+    def mark_cancelled(self, request_id: str) -> None:
+        with self._lock:
+            self._connection.execute(
+                "UPDATE executions SET cancelled_at=?,updated_at=? WHERE request_id=?",
+                (iso(), iso(), request_id),
+            )
 
     def cancel_pending(self, request_id: str) -> int:
         with self._lock:
