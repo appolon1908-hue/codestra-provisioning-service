@@ -110,7 +110,8 @@ class ProvisioningEngine:
                             return current.model_copy(update={"replayed": True})
                     if activation_steps:
                         blockers = self.repository.activation_blockers(
-                            execution.employee_id
+                            execution.employee_id,
+                            {step.target_system.value for step in activation_steps},
                         )
                         if blockers:
                             raise EngineError(
@@ -174,7 +175,7 @@ class ProvisioningEngine:
                 return await self._run_request(request_id, employee_locked=True)
         while command := self.repository.claim_next(request_id):
             if command.operation == Operation.ACTIVATE and self.repository.activation_blockers(
-                command.employee_id
+                command.employee_id, {command.target_system.value}
             ):
                 self.repository.release_activation_claim(command.step_id)
                 return
