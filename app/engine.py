@@ -60,6 +60,7 @@ class ProvisioningEngine:
         self.settings = settings
         self.callback_dispatcher = callback_dispatcher
         self._locks: dict[str, asyncio.Lock] = {}
+        self._employee_locks: dict[str, asyncio.Lock] = {}
         self._recovery_task: asyncio.Task | None = None
         self._stopping = asyncio.Event()
 
@@ -84,33 +85,37 @@ class ProvisioningEngine:
         if execution.request_id != request_id:
             raise EngineError(422, "request_id_mismatch")
         self._validate_freshness(execution)
-        if execution.operation == Operation.ACTIVATE or any(
-            step.operation == Operation.ACTIVATE for step in execution.steps
-        ):
-            blockers = self.repository.activation_blockers(execution.employee_id)
-            if blockers:
-                raise EngineError(409, "mandatory_verification_incomplete")
-        normalized = self._normalize_keys(execution)
-        lock = self._locks.setdefault(request_id, asyncio.Lock())
-        async with lock:
-            try:
-                existing, replayed = self.repository.begin_execution(
-                    normalized, canonical_hash(normalized)
-                )
-            except IdempotencyConflict as exc:
-                raise EngineError(409, str(exc)) from exc
-            if replayed:
-                current = existing or self.repository.request_result(
-                    request_id, replayed=True
-                )
-                if current:
-                    return current.model_copy(update={"replayed": True})
-            await self._run_request(request_id)
-            result = self.repository.request_result(request_id)
-            if not result:
-                raise EngineError(500, "execution_state_missing")
-            await self._callback(normalized, result)
-            return result
+        employee_lock = self._employee_locks.setdefault(
+            execution.employee_id, asyncio.Lock()
+        )
+        async with employee_lock:
+            if execution.operation == Operation.ACTIVATE or any(
+                step.operation == Operation.ACTIVATE for step in execution.steps
+            ):
+                blockers = self.repository.activation_blockers(execution.employee_id)
+                if blockers:
+                    raise EngineError(409, "mandatory_verification_incomplete")
+            normalized = self._normalize_keys(execution)
+            lock = self._locks.setdefault(request_id, asyncio.Lock())
+            async with lock:
+                try:
+                    existing, replayed = self.repository.begin_execution(
+                        normalized, canonical_hash(normalized)
+                    )
+                except IdempotencyConflict as exc:
+                    raise EngineError(409, str(exc)) from exc
+                if replayed:
+                    current = existing or self.repository.request_result(
+                        request_id, replayed=True
+                    )
+                    if current:
+                        return current.model_copy(update={"replayed": True})
+                await self._run_request(request_id)
+                result = self.repository.request_result(request_id)
+                if not result:
+                    raise EngineError(500, "execution_state_missing")
+                await self._callback(normalized, result)
+                return result
 
     async def retry(self, request_id: str, action: ActionRequest) -> ExecutionResult:
         if not enabled("RETRY_GATE"):
@@ -305,8 +310,28 @@ class ProvisioningEngine:
         current = self.repository.request_result(request_id)
         if not current:
             raise EngineError(404, "request_not_found")
+        employee_lock = self._employee_locks.setdefault(
+            current.employee_id, asyncio.Lock()
+        )
+        async with employee_lock:
+            return await self._verify_locked(request_id, action, current)
+
+    async def _verify_locked(
+        self,
+        request_id: str,
+        action: ActionRequest,
+        current: ExecutionResult,
+    ) -> ExecutionResult:
+        originals = self.repository.successful_commands(request_id)
+        if any(
+            not self.repository.is_current_verification_candidate(
+                current.employee_id, original.target_system.value, original.step_id
+            )
+            for original in originals
+        ):
+            raise EngineError(409, "stale_verification_conflict")
         results = []
-        for original in self.repository.successful_commands(request_id):
+        for original in originals:
             command = original.model_copy(
                 update={
                     "operation": Operation.VERIFY,
@@ -343,12 +368,14 @@ class ProvisioningEngine:
                         )
                     )
                     continue
-                self.repository.record_verification(
+                accepted = self.repository.record_verification(
                     current.employee_id,
                     command.target_system.value,
                     original.step_id,
                     evidence,
                 )
+                if not accepted:
+                    raise EngineError(409, "stale_verification_conflict")
                 results.append(
                     current.step_results[0].model_copy(
                         update={

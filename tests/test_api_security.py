@@ -1,12 +1,14 @@
 import time
 import uuid
 from dataclasses import replace
+from inspect import getclosurevars
 from types import SimpleNamespace
 
 import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
@@ -22,7 +24,7 @@ from app.config import (
 from app.contracts import TargetSystem
 from app.main import create_app
 from app.repository import StateRepository
-from app.security import JWTAuthorizer
+from app.security import JWTAuthorizer, Principal
 from tests.helpers import FakeAdapter, execution
 
 
@@ -250,6 +252,18 @@ def test_readiness_rejects_sip_boundary_overrides_and_not_jwks_local_key(tmp_pat
     assert "jwt_public_key_missing" not in errors
 
 
+def test_local_key_mode_requires_existing_public_key(tmp_path):
+    _, settings, _, _ = material(tmp_path)
+    missing = replace(
+        settings,
+        jwt_jwks_url="",
+        jwt_public_key_file=str(tmp_path / "absent.pem"),
+    )
+    assert "jwt_public_key_missing" in missing.readiness_errors()
+    present = replace(settings, jwt_jwks_url="")
+    assert "jwt_public_key_missing" not in present.readiness_errors()
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     (("SIP_BROWSER_ENDPOINT", "6102"), ("SIP_BROWSER_CAMPAIGN", "OTHER")),
@@ -303,6 +317,67 @@ def test_required_route_set_is_exact(tmp_path):
         ("GET", "/metrics"),
     }
     assert required <= routes
+
+
+@pytest.mark.asyncio
+async def test_every_protected_route_enforces_its_contract_scope(
+    tmp_path, monkeypatch
+):
+    _, _, app, _ = material(tmp_path)
+    expected = {
+        ("POST", "/v1/provisioning/requests/{request_id}/execute"): "provisioning:execute",
+        ("POST", "/v1/provisioning/requests/{request_id}/retry"): "provisioning:execute",
+        ("POST", "/v1/provisioning/requests/{request_id}/verify"): "provisioning:execute",
+        ("POST", "/v1/provisioning/requests/{request_id}/cancel"): "provisioning:execute",
+        ("GET", "/v1/provisioning/requests/{request_id}"): "provisioning:read",
+        ("POST", "/v1/identities/{employee_id}/suspend"): "provisioning:execute",
+        ("POST", "/v1/identities/{employee_id}/reactivate"): "provisioning:execute",
+        ("POST", "/v1/identities/{employee_id}/terminate"): "provisioning:execute",
+        ("POST", "/v1/identities/{employee_id}/rotate"): "identity:rotate",
+        ("GET", "/v1/identities/{employee_id}/reconciliation"): "provisioning:read",
+        ("POST", "/session"): "provisioning:execute",
+        ("POST", "/renew"): "identity:rotate",
+        ("GET", "/config"): "provisioning:read",
+        ("POST", "/revoke"): "identity:rotate",
+    }
+    actual = {}
+    dependencies = {}
+    for route in app.routes:
+        for method in route.methods or []:
+            key = (method, route.path)
+            if key not in expected:
+                continue
+            scopes = [
+                getclosurevars(item.call).nonlocals.get("required")
+                for item in route.dependant.dependencies
+                if item.call.__name__ == "dependency"
+            ]
+            assert len(scopes) == 1
+            actual[key] = scopes[0]
+            dependencies[key] = next(
+                item.call
+                for item in route.dependant.dependencies
+                if item.call.__name__ == "dependency"
+            )
+    assert actual == expected
+    request = Request({"type": "http", "query_string": b"", "headers": []})
+    for key, required in expected.items():
+        dependency = dependencies[key]
+        authorizer = getclosurevars(dependency).nonlocals["authorizer"]
+
+        async def authorized(*_, granted=required):
+            return Principal("subject", "test-service", frozenset({granted}))
+
+        monkeypatch.setattr(authorizer, "authenticate", authorized)
+        assert (await dependency(request, None)).scopes == frozenset({required})
+
+        async def unauthorized(*_):
+            return Principal("subject", "test-service", frozenset())
+
+        monkeypatch.setattr(authorizer, "authenticate", unauthorized)
+        with pytest.raises(HTTPException) as denied:
+            await dependency(request, None)
+        assert denied.value.status_code == 403
 
 
 def test_authoritative_numeric_odoo_request_id_is_accepted(tmp_path):

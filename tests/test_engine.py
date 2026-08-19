@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 
 import pytest
@@ -230,6 +231,84 @@ async def test_activation_requires_durable_mandatory_verification(tmp_path):
     )
     replay = await restarted.submit(activation.request_id, activation)
     assert replay.replayed
+
+
+@pytest.mark.asyncio
+async def test_activation_serializes_against_new_mandatory_employee_update(tmp_path):
+    class BlockingUpdateAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.update_started = asyncio.Event()
+            self.release_update = asyncio.Event()
+
+        async def update(self, command):
+            self.calls.append(command)
+            self.update_started.set()
+            await self.release_update.wait()
+            return {"state": "succeeded", "external_id": "updated"}
+
+    adapter = BlockingUpdateAdapter()
+    service = engine(tmp_path, adapter)
+    created = execution()
+    await service.submit(created.request_id, created)
+    await service.verify(
+        created.request_id, action(created.request_id, Operation.VERIFY)
+    )
+    update = execution(
+        request_id="concurrent-update-0001",
+        employee_id=created.employee_id,
+        key="concurrent-update-idempotency",
+        operation=Operation.UPDATE,
+    )
+    activation = execution(
+        request_id="concurrent-activation-0001",
+        employee_id=created.employee_id,
+        key="concurrent-activation-idempotency",
+        operation=Operation.ACTIVATE,
+    )
+    update_task = asyncio.create_task(service.submit(update.request_id, update))
+    await adapter.update_started.wait()
+    activation_task = asyncio.create_task(
+        service.submit(activation.request_id, activation)
+    )
+    await asyncio.sleep(0)
+    assert not activation_task.done()
+    adapter.release_update.set()
+    await update_task
+    with pytest.raises(EngineError, match="mandatory_verification_incomplete"):
+        await activation_task
+
+
+@pytest.mark.asyncio
+async def test_stale_verification_is_reported_as_conflict(tmp_path):
+    adapter = FakeAdapter()
+    service = engine(tmp_path, adapter)
+    created = execution()
+    await service.submit(created.request_id, created)
+    await service.verify(
+        created.request_id, action(created.request_id, Operation.VERIFY)
+    )
+    update = execution(
+        request_id="newer-update-0001",
+        employee_id=created.employee_id,
+        key="newer-update-idempotency",
+        operation=Operation.UPDATE,
+    )
+    await service.submit(update.request_id, update)
+    await service.verify(update.request_id, action(update.request_id, Operation.VERIFY))
+    before = service.repository._connection.execute(
+        "SELECT source_step_id,evidence_hash FROM verification_records"
+    ).fetchone()
+    with pytest.raises(EngineError) as stale:
+        await service.verify(
+            created.request_id, action(created.request_id, Operation.VERIFY)
+        )
+    assert stale.value.status_code == 409
+    assert stale.value.code == "stale_verification_conflict"
+    after = service.repository._connection.execute(
+        "SELECT source_step_id,evidence_hash FROM verification_records"
+    ).fetchone()
+    assert tuple(after) == tuple(before)
 
 
 @pytest.mark.asyncio
