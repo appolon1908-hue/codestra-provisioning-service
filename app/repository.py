@@ -560,6 +560,37 @@ class StateRepository:
             latest.setdefault(command.target_system.value, command)
         return list(latest.values())
 
+    def verification_commands(self, request_id: str) -> list[StepCommand]:
+        """Return current mandatory evidence targets plus current optional checks."""
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT command_json FROM steps WHERE request_id=?
+                   AND state IN ('succeeded','verified') ORDER BY sequence DESC""",
+                (request_id,),
+            ).fetchall()
+        mandatory: dict[str, StepCommand] = {}
+        optional: dict[str, StepCommand] = {}
+        for row in rows:
+            command = StepCommand.model_validate_json(row["command_json"])
+            selected = mandatory if command.mandatory else optional
+            selected.setdefault(command.target_system.value, command)
+        return [*mandatory.values(), *optional.values()]
+
+    def release_activation_claim(self, step_id: str) -> None:
+        """Return a claimed activation to retry_wait without consuming an attempt."""
+        with self._lock:
+            self._connection.execute(
+                """UPDATE steps SET state='retry_wait',attempt_count=MAX(attempt_count-1,0),
+                   error_code='mandatory_verification_incomplete',next_retry_at=?,
+                   claimed_at=NULL,updated_at=? WHERE step_id=? AND state='running'""",
+                (iso(), iso(), step_id),
+            )
+            self._connection.execute(
+                """UPDATE executions SET state='retry_wait',updated_at=?
+                   WHERE request_id=(SELECT request_id FROM steps WHERE step_id=?)""",
+                (iso(), step_id),
+            )
+
     def record_verification(
         self,
         employee_id: str,

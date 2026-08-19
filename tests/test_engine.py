@@ -380,6 +380,75 @@ async def test_optional_step_does_not_make_mandatory_verification_stale(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_newer_optional_step_cannot_hide_mandatory_verification(tmp_path):
+    adapter = FakeAdapter()
+    service = engine(tmp_path, adapter)
+    request = execution(steps=2)
+    request = request.model_copy(
+        update={
+            "steps": [
+                request.steps[0],
+                request.steps[1].model_copy(update={"mandatory": False}),
+            ]
+        }
+    )
+    assert (await service.submit(request.request_id, request)).state == "completed"
+    verified = await service.verify(
+        request.request_id, action(request.request_id, Operation.VERIFY)
+    )
+    assert verified.state == "verified"
+    record = service.repository._connection.execute(
+        "SELECT source_step_id FROM verification_records WHERE target_system='odoo'"
+    ).fetchone()
+    assert record["source_step_id"] == request.steps[0].step_id
+    assert len(verified.step_results) == 2
+
+
+@pytest.mark.asyncio
+async def test_activation_retry_rechecks_newer_mandatory_blockers(tmp_path):
+    class RetryActivationOnceAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.activation_attempts = 0
+
+        async def activate(self, command):
+            self.calls.append(command)
+            self.activation_attempts += 1
+            if self.activation_attempts == 1:
+                raise RetryableAdapterError("activation_timeout")
+            return {"state": "succeeded", "external_id": "activated"}
+
+    adapter = RetryActivationOnceAdapter()
+    service = engine(tmp_path, adapter)
+    created = execution()
+    await service.submit(created.request_id, created)
+    await service.verify(
+        created.request_id, action(created.request_id, Operation.VERIFY)
+    )
+    activation = execution(
+        request_id="activation-retry-guard-0001",
+        employee_id=created.employee_id,
+        key="activation-retry-guard-idempotency",
+        operation=Operation.ACTIVATE,
+    )
+    assert (await service.submit(activation.request_id, activation)).state == "retry_wait"
+    update = execution(
+        request_id="update-before-activation-retry-0001",
+        employee_id=created.employee_id,
+        key="update-before-activation-retry-key",
+        operation=Operation.UPDATE,
+    )
+    await service.submit(update.request_id, update)
+    calls_before_retry = len(adapter.calls)
+    retried = await service.retry(
+        activation.request_id, action(activation.request_id, Operation.UPDATE)
+    )
+    assert retried.state == "retry_wait"
+    assert retried.step_results[0].error_code == "mandatory_verification_incomplete"
+    assert len(adapter.calls) == calls_before_retry
+
+
+@pytest.mark.asyncio
 async def test_completed_activation_replay_precedes_new_blocker_check(tmp_path):
     adapter = FakeAdapter()
     service = engine(tmp_path, adapter)
