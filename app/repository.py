@@ -548,6 +548,28 @@ class StateRepository:
         evidence_hash: str,
     ) -> None:
         with self._lock:
+            rows = self._connection.execute(
+                """SELECT s.command_json FROM steps s
+                   JOIN executions e USING(request_id)
+                   WHERE e.employee_id=? AND s.state IN ('succeeded','verified')
+                   ORDER BY s.updated_at DESC""",
+                (employee_id,),
+            ).fetchall()
+            current_step_id = next(
+                (
+                    command.step_id
+                    for row in rows
+                    if (command := StepCommand.model_validate_json(row["command_json"]))
+                    .target_system.value
+                    == target_system
+                    and command.mandatory
+                    and command.operation
+                    in {Operation.CREATE_DISABLED, Operation.UPDATE}
+                ),
+                None,
+            )
+            if current_step_id != source_step_id:
+                return
             self._connection.execute(
                 """INSERT INTO verification_records
                    (employee_id,target_system,source_step_id,evidence_hash,verified_at)
@@ -569,19 +591,21 @@ class StateRepository:
         """Return mandatory systems that lack verification of their latest step."""
         with self._lock:
             rows = self._connection.execute(
-                """SELECT s.command_json FROM steps s
+                """SELECT s.command_json,s.state FROM steps s
                    JOIN executions e USING(request_id)
-                   WHERE e.employee_id=? AND s.state IN ('succeeded','verified')
+                   WHERE e.employee_id=?
                    ORDER BY s.updated_at DESC""",
                 (employee_id,),
             ).fetchall()
         latest: dict[str, StepCommand] = {}
         created_disabled: set[str] = set()
+        latest_state: dict[str, str] = {}
         for row in rows:
             command = StepCommand.model_validate_json(row["command_json"])
             if (
                 command.mandatory
                 and command.operation == Operation.CREATE_DISABLED
+                and row["state"] in {"succeeded", "verified"}
             ):
                 created_disabled.add(command.target_system.value)
             if (
@@ -590,6 +614,7 @@ class StateRepository:
                 in {Operation.CREATE_DISABLED, Operation.UPDATE}
             ):
                 latest.setdefault(command.target_system.value, command)
+                latest_state.setdefault(command.target_system.value, row["state"])
         if not latest:
             return ["created_disabled_account_missing"]
         with self._lock:
@@ -605,7 +630,9 @@ class StateRepository:
         for system, command in latest.items():
             if system not in created_disabled:
                 blockers.append(f"{system}:created_disabled_missing")
-            if verified.get(system) != command.step_id:
+            if latest_state[system] not in {"succeeded", "verified"}:
+                blockers.append(f"{system}:provisioning_incomplete")
+            elif verified.get(system) != command.step_id:
                 blockers.append(f"{system}:verification_missing")
         return sorted(blockers)
 
@@ -803,17 +830,32 @@ class StateRepository:
                 """SELECT s.command_json FROM steps s
                    JOIN executions e USING(request_id)
                    WHERE e.employee_id=? AND s.state IN ('succeeded','verified')
-                   ORDER BY s.updated_at DESC""",
+                   ORDER BY s.updated_at ASC""",
                 (employee_id,),
             ).fetchall()
-        latest: dict[str, StepCommand] = {}
-        canonical: dict[str, StepCommand] = {}
+        current: dict[str, StepCommand] = {}
+        payloads: dict[str, dict[str, Any]] = {}
+
+        def merged(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
+            result = dict(base)
+            for key, value in update.items():
+                if isinstance(value, dict) and isinstance(result.get(key), dict):
+                    result[key] = merged(result[key], value)
+                else:
+                    result[key] = value
+            return result
+
         for row in rows:
             command = StepCommand.model_validate_json(row["command_json"])
-            latest.setdefault(command.target_system.value, command)
-            if command.operation == Operation.CREATE_DISABLED:
-                canonical.setdefault(command.target_system.value, command)
-        return [canonical.get(system, command) for system, command in latest.items()]
+            system = command.target_system.value
+            if system not in current and command.operation != Operation.CREATE_DISABLED:
+                continue
+            current[system] = command
+            payloads[system] = merged(payloads.get(system, {}), command.payload)
+        return [
+            command.model_copy(update={"payload": payloads[system]})
+            for system, command in current.items()
+        ]
 
     def accept_jti(self, jti: str, expires_at: int) -> bool:
         with self._lock:
