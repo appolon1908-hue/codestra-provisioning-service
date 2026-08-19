@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import sqlite3
 from datetime import UTC, datetime
 
@@ -9,7 +11,7 @@ from app.adapters import SecretStorageAdapter
 from app.callbacks import CallbackDispatcher
 from app.config import Settings
 from app.contracts import Operation, StepState, TargetSystem
-from app.engine import EngineError, ProvisioningEngine
+from app.engine import EngineError, ProvisioningEngine, canonical_hash
 from app.repository import StateRepository
 from tests.helpers import (
     FakeAdapter,
@@ -53,6 +55,32 @@ def engine(tmp_path, adapter):
     return ProvisioningEngine(
         {TargetSystem.ODOO.value: adapter}, repository, configured, callbacks
     )
+
+
+def test_canonical_hash_preserves_legacy_default_mandatory_representation():
+    request = execution()
+    document = request.model_dump(mode="json")
+    for step in document["steps"]:
+        step.pop("mandatory")
+    legacy_hash = hashlib.sha256(
+        json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode()
+    ).hexdigest()
+    assert canonical_hash(request) == legacy_hash
+
+
+def test_canonical_hash_retains_explicit_optional_step():
+    request = execution()
+    optional = request.model_copy(
+        update={
+            "steps": [request.steps[0].model_copy(update={"mandatory": False})]
+        }
+    )
+    assert canonical_hash(optional) != canonical_hash(request)
 
 
 @pytest.mark.asyncio

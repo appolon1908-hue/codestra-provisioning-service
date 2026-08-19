@@ -33,9 +33,13 @@ class EngineError(RuntimeError):
 
 
 def canonical_hash(execution: RequestExecution) -> str:
+    document = execution.model_dump(mode="json")
+    for step in document["steps"]:
+        if step.get("mandatory") is True:
+            step.pop("mandatory")
     return hashlib.sha256(
         json.dumps(
-            execution.model_dump(mode="json"),
+            document,
             sort_keys=True,
             separators=(",", ":"),
             default=str,
