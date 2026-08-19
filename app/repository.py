@@ -581,8 +581,7 @@ class StateRepository:
                    AND state IN ('succeeded','verified') ORDER BY sequence DESC""",
                 (request_id,),
             ).fetchall()
-        mandatory: dict[str, StepCommand] = {}
-        optional: dict[str, StepCommand] = {}
+        latest: dict[str, StepCommand] = {}
         for row in rows:
             command = StepCommand.model_validate_json(row["command_json"])
             if command.operation not in {
@@ -590,9 +589,8 @@ class StateRepository:
                 Operation.UPDATE,
             }:
                 continue
-            selected = mandatory if command.mandatory else optional
-            selected.setdefault(command.target_system.value, command)
-        return [*mandatory.values(), *optional.values()]
+            latest.setdefault(command.target_system.value, command)
+        return list(latest.values())
 
     def compensation_superseded(
         self, request_id: str, source_step_id: str, target_system: str
@@ -693,7 +691,6 @@ class StateRepository:
                 if (command := StepCommand.model_validate_json(row["command_json"]))
                 .target_system.value
                 == target_system
-                and command.mandatory
                 and command.operation
                 in {Operation.CREATE_DISABLED, Operation.UPDATE}
             ),
@@ -727,14 +724,12 @@ class StateRepository:
         for row in rows:
             command = StepCommand.model_validate_json(row["command_json"])
             if (
-                command.mandatory
-                and command.operation == Operation.CREATE_DISABLED
+                command.operation == Operation.CREATE_DISABLED
                 and row["state"] in {"succeeded", "verified"}
             ):
                 created_disabled.add(command.target_system.value)
             if (
-                command.mandatory
-                and command.operation
+                command.operation
                 in {Operation.CREATE_DISABLED, Operation.UPDATE}
             ):
                 latest.setdefault(command.target_system.value, command)
@@ -846,6 +841,14 @@ class StateRepository:
                 "UPDATE executions SET cancelled_at=?,updated_at=? WHERE request_id=?",
                 (iso(), iso(), request_id),
             )
+
+    def is_cancelled(self, request_id: str) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT cancelled_at FROM executions WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            return bool(row and row["cancelled_at"])
 
     def cancel_pending(self, request_id: str) -> int:
         with self._lock:

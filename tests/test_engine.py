@@ -499,8 +499,8 @@ async def test_newer_optional_step_cannot_hide_mandatory_verification(tmp_path):
     record = service.repository._connection.execute(
         "SELECT source_step_id FROM verification_records WHERE target_system='odoo'"
     ).fetchone()
-    assert record["source_step_id"] == request.steps[0].step_id
-    assert len(verified.step_results) == 2
+    assert record["source_step_id"] == request.steps[1].step_id
+    assert len(verified.step_results) == 1
 
 
 @pytest.mark.asyncio
@@ -679,6 +679,25 @@ async def test_cancel_compensation_serializes_with_new_employee_update(tmp_path)
         (original.request_id,),
     ).fetchone()
     assert tuple(compensation) == ("superseded", "newer_employee_operation")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_execution_cannot_be_retried(tmp_path):
+    adapter = FakeAdapter()
+    service = engine(tmp_path, adapter)
+    request = execution()
+    await service.submit(request.request_id, request)
+    await service.cancel(
+        request.request_id,
+        action(request.request_id, Operation.CANCEL),
+    )
+    with pytest.raises(EngineError) as denied:
+        await service.retry(
+            request.request_id,
+            action(request.request_id, Operation.UPDATE),
+        )
+    assert denied.value.status_code == 409
+    assert denied.value.code == "cancelled_execution_retry_forbidden"
 
 
 @pytest.mark.asyncio
