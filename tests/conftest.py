@@ -1,0 +1,15 @@
+import os
+
+for gate in (
+    "PROVISIONING_SERVICE_GATE",
+    "SERVICE_AUTHENTICATION_GATE",
+    "SERVICE_AUTHORIZATION_GATE",
+    "STEP_ENGINE_GATE",
+    "RETRY_GATE",
+    "DEAD_LETTER_GATE",
+    "CALLBACK_GATE",
+    "RECONCILIATION_GATE",
+    "SECRET_STORAGE_GATE",
+    "RESTART_RECOVERY_GATE",
+):
+    os.environ[gate] = "true"

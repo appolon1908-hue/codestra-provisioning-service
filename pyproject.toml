@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codestra-provisioning-service"
+version = "1.0.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "cryptography==49.0.0",
+  "fastapi==0.139.2",
+  "httpx==0.28.1",
+  "pydantic==2.11.7",
+  "PyJWT==2.13.0",
+  "starlette==1.3.1",
+  "uvicorn==0.35.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--strict-markers --strict-config"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "RUF", "PIE"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S105", "S106"]
+"app/contracts.py" = ["S105"]
