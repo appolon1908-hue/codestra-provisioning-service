@@ -203,6 +203,24 @@ def test_retried_request_is_removed_from_due_compensation(tmp_path):
     assert repository.due_compensation_request_ids() == []
 
 
+def test_cancelled_request_keeps_failed_compensation_due(tmp_path):
+    repository = StateRepository(str(tmp_path / "state.db"))
+    request = execution()
+    repository.begin_execution(request, "a" * 64)
+    repository.complete_step(request.steps[0].step_id, StepState.SUCCEEDED, {})
+    repository.record_compensation(
+        request.request_id,
+        request.steps[0].step_id,
+        Operation.UPDATE.value,
+        "failed",
+        error_code="compensation_timeout",
+        retry_delay_seconds=0,
+    )
+    assert repository.due_compensation_request_ids() == []
+    repository.mark_cancelled(request.request_id)
+    assert repository.due_compensation_request_ids() == [request.request_id]
+
+
 def test_activation_blocks_incomplete_latest_mandatory_step(tmp_path):
     repository = StateRepository(str(tmp_path / "state.db"))
     created = execution()
