@@ -449,6 +449,57 @@ async def test_activation_retry_rechecks_newer_mandatory_blockers(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_due_compensation_serializes_with_new_employee_update(tmp_path):
+    class BlockingUpdateAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.update_started = asyncio.Event()
+            self.release_update = asyncio.Event()
+            self.call_order = []
+
+        async def update(self, command):
+            self.calls.append(command)
+            if command.payload.get("compensation"):
+                self.call_order.append("compensation")
+                return {"state": "succeeded", "external_id": "suspended"}
+            self.call_order.append("update_started")
+            self.update_started.set()
+            await self.release_update.wait()
+            self.call_order.append("update_completed")
+            return {"state": "succeeded", "external_id": "updated"}
+
+    adapter = BlockingUpdateAdapter()
+    service = engine(tmp_path, adapter)
+    original = execution()
+    await service.submit(original.request_id, original)
+    service.repository.record_compensation(
+        original.request_id,
+        original.steps[0].step_id,
+        Operation.UPDATE.value,
+        "failed",
+        error_code="synthetic_retry",
+        retry_delay_seconds=0,
+    )
+    update = execution(
+        request_id="update-during-compensation-0001",
+        employee_id=original.employee_id,
+        key="update-during-compensation-key",
+        operation=Operation.UPDATE,
+    )
+    update_task = asyncio.create_task(service.submit(update.request_id, update))
+    await adapter.update_started.wait()
+    compensation_task = asyncio.create_task(
+        service._compensate_due(original.request_id)
+    )
+    await asyncio.sleep(0)
+    assert not compensation_task.done()
+    adapter.release_update.set()
+    await update_task
+    await compensation_task
+    assert adapter.call_order[-2:] == ["update_completed", "compensation"]
+
+
+@pytest.mark.asyncio
 async def test_completed_activation_replay_precedes_new_blocker_check(tmp_path):
     adapter = FakeAdapter()
     service = engine(tmp_path, adapter)
