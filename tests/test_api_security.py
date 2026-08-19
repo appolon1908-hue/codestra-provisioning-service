@@ -6,7 +6,15 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
-from app.config import Settings
+from app.config import (
+    CANONICAL_ISSUER,
+    CANONICAL_JWKS_URL,
+    MACHINE_AUDIENCE,
+    MACHINE_CLIENT_ID,
+    MACHINE_SCOPES,
+    MAX_TOKEN_TTL_SECONDS,
+    Settings,
+)
 from app.contracts import TargetSystem
 from app.main import create_app
 from app.repository import StateRepository
@@ -46,6 +54,11 @@ def material(tmp_path):
         adapter_config_file=str(placeholder),
         tls_cert_file=str(placeholder),
         tls_key_file=str(placeholder),
+        jwt_expected_azp="test-service",
+        jwt_required_scopes=frozenset(
+            {"identity:rotate", "provisioning:execute", "provisioning:read"}
+        ),
+        jwt_max_token_ttl_seconds=300,
     )
     repository = StateRepository(configured.state_database_path)
     adapter = FakeAdapter()
@@ -57,14 +70,14 @@ def material(tmp_path):
     return private, configured, app, adapter
 
 
-def token(private, settings, scope="provisioning:execute", **changes):
+def token(private, settings, **changes):
     now = int(time.time())
     claims = {
         "iss": settings.jwt_issuer,
         "aud": settings.jwt_audience,
         "sub": "service-account-test",
         "azp": "test-service",
-        "scope": scope,
+        "codestra_scopes": "identity:rotate provisioning:execute provisioning:read",
         "typ": "Bearer",
         "iat": now,
         "nbf": now - 1,
@@ -82,20 +95,18 @@ def test_strict_jwt_scope_replay_and_private_tls(tmp_path):
     url = f"/v1/provisioning/requests/{request.request_id}/execute"
     with TestClient(app, base_url="https://provisioning-service") as client:
         assert client.post(url, json=request.model_dump(mode="json")).status_code == 401
-        wrong_scope = token(private, settings, "provisioning:read")
+        wrong_scope = token(private, settings, codestra_scopes="provisioning:read")
         assert (
             client.post(
                 url,
                 json=request.model_dump(mode="json"),
                 headers={"Authorization": f"Bearer {wrong_scope}"},
             ).status_code
-            == 403
+            == 401
         )
         valid = token(
             private,
             settings,
-            scope="",
-            codestra_scopes="provisioning:execute",
             nbf=None,
         )
         response = client.post(
@@ -132,6 +143,91 @@ def test_strict_issuer_audience_and_size_limit(tmp_path):
             headers={"Content-Type": "application/octet-stream"},
         )
         assert oversized.status_code == 413
+
+
+def test_canonical_token_contract_negative_matrix(tmp_path):
+    private, settings, app, _ = material(tmp_path)
+    request = execution()
+    url = f"/v1/provisioning/requests/{request.request_id}/execute"
+    second_private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now = int(time.time())
+    cases = (
+        token(private, settings, iss="https://auth.codestra.agency/realms/codestra"),
+        token(private, settings, aud="wrong-audience"),
+        token(private, settings, azp="codestra-client-provisioner"),
+        token(private, settings, azp="codestra-middleware-production"),
+        token(private, settings, azp="codestra-n8n"),
+        token(private, settings, azp=None),
+        token(private, settings, iat=None),
+        token(private, settings, exp=None),
+        token(private, settings, iat=now, exp=now),
+        token(private, settings, iat=now, exp=now + 301),
+        token(private, settings, iat=now - 600, exp=now - 300),
+        token(private, settings, jti=None),
+        token(private, settings, codestra_scopes=None, scope="provisioning:execute"),
+        token(private, settings, codestra_scopes="identity:rotate provisioning:read"),
+        token(private, settings, codestra_scopes="identity:rotate provisioning:execute"),
+        token(private, settings, codestra_scopes="provisioning:execute provisioning:read"),
+        token(
+            private,
+            settings,
+            codestra_scopes=(
+                "identity:rotate provisioning:execute provisioning:read realm-admin"
+            ),
+        ),
+        token(second_private, settings),
+    )
+    with TestClient(app, base_url="https://provisioning-service") as client:
+        for candidate in cases:
+            response = client.post(
+                url,
+                json=request.model_dump(mode="json"),
+                headers={"Authorization": f"Bearer {candidate}"},
+            )
+            assert response.status_code == 401
+
+
+def test_maximum_300_second_token_and_replay(tmp_path):
+    private, settings, app, _ = material(tmp_path)
+    request = execution()
+    url = f"/v1/provisioning/requests/{request.request_id}/execute"
+    now = int(time.time())
+    candidate = token(private, settings, iat=now, exp=now + 300)
+    with TestClient(app, base_url="https://provisioning-service") as client:
+        first = client.post(
+            url,
+            json=request.model_dump(mode="json"),
+            headers={"Authorization": f"Bearer {candidate}"},
+        )
+        assert first.status_code == 200
+        replay = client.post(
+            url,
+            json=request.model_dump(mode="json"),
+            headers={"Authorization": f"Bearer {candidate}"},
+        )
+        assert replay.status_code == 409
+
+
+def test_runtime_defaults_are_the_canonical_machine_contract(monkeypatch):
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    for name in (
+        "JWT_ISSUER",
+        "JWT_JWKS_URL",
+        "JWT_AUDIENCE",
+        "JWT_EXPECTED_AZP",
+        "JWT_ALLOWED_CLIENTS",
+        "JWT_REQUIRED_SCOPES",
+        "JWT_MAX_TOKEN_TTL_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings.load()
+    assert settings.jwt_issuer == CANONICAL_ISSUER
+    assert settings.jwt_jwks_url == CANONICAL_JWKS_URL
+    assert settings.jwt_audience == MACHINE_AUDIENCE
+    assert settings.jwt_expected_azp == MACHINE_CLIENT_ID
+    assert settings.jwt_allowed_clients == frozenset({MACHINE_CLIENT_ID})
+    assert settings.jwt_required_scopes == MACHINE_SCOPES
+    assert settings.jwt_max_token_ttl_seconds == MAX_TOKEN_TTL_SECONDS
 
 
 def test_required_route_set_is_exact(tmp_path):

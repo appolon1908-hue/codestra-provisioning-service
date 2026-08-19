@@ -120,8 +120,20 @@ class StateRepository:
               state TEXT NOT NULL,
               evidence_hash TEXT,
               error_code TEXT,
+              attempt_count INTEGER NOT NULL DEFAULT 0,
+              max_attempts INTEGER NOT NULL DEFAULT 3,
+              next_retry_at TEXT,
+              updated_at TEXT,
               created_at TEXT NOT NULL,
               UNIQUE(request_id,step_id,action)
+            );
+            CREATE TABLE IF NOT EXISTS verification_records (
+              employee_id TEXT NOT NULL,
+              target_system TEXT NOT NULL,
+              source_step_id TEXT NOT NULL,
+              evidence_hash TEXT NOT NULL,
+              verified_at TEXT NOT NULL,
+              PRIMARY KEY(employee_id,target_system)
             );
             CREATE TABLE IF NOT EXISTS mock_mailboxes (
               employee_id TEXT PRIMARY KEY,
@@ -156,6 +168,22 @@ class StateRepository:
               WHERE state='active';
             """
         )
+        compensation_columns = {
+            row["name"]
+            for row in self._connection.execute(
+                "PRAGMA table_info(compensation_actions)"
+            ).fetchall()
+        }
+        for name, definition in (
+            ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("max_attempts", "INTEGER NOT NULL DEFAULT 3"),
+            ("next_retry_at", "TEXT"),
+            ("updated_at", "TEXT"),
+        ):
+            if name not in compensation_columns:
+                self._connection.execute(
+                    f"ALTER TABLE compensation_actions ADD COLUMN {name} {definition}"
+                )
 
     def transition_mock_mailbox(
         self,
@@ -223,7 +251,7 @@ class StateRepository:
                 self._connection.execute(
                     f"""UPDATE mock_mailboxes
                         SET provisioning_state=?,{timestamp_column}=?
-                        WHERE employee_id=?""",
+                        WHERE employee_id=?""",  # noqa: S608
                     (next_state, iso(), employee_id),
                 )
                 row = self._connection.execute(
@@ -234,18 +262,10 @@ class StateRepository:
 
     def active_sip_browser_session(self, employee_id: str) -> dict | None:
         with self._lock:
-            # Expiration is authoritative even if the worker has not run a
-            # cleanup pass yet. Marking it here also releases the unique
-            # active-employee constraint for a subsequent login.
-            self._connection.execute(
-                """UPDATE sip_browser_sessions SET state='expired',updated_at=?
-                   WHERE employee_id=? AND state='active' AND expires_at<=?""",
-                (iso(), employee_id, iso()),
-            )
             row = self._connection.execute(
                 """SELECT * FROM sip_browser_sessions
-                   WHERE employee_id=? AND state='active' AND expires_at>?""",
-                (employee_id, iso()),
+                   WHERE employee_id=? AND state='active'""",
+                (employee_id,),
             ).fetchone()
             return dict(row) if row else None
 
@@ -297,15 +317,6 @@ class StateRepository:
             )
             if cursor.rowcount != 1:
                 raise LookupError("sip_browser_session_not_active")
-        return self.sip_browser_session(session_id) or {}
-
-    def expire_sip_browser_session(self, session_id: str) -> dict:
-        with self._lock:
-            self._connection.execute(
-                """UPDATE sip_browser_sessions SET state='expired',updated_at=?
-                   WHERE session_id=? AND state='active'""",
-                (iso(), session_id),
-            )
         return self.sip_browser_session(session_id) or {}
 
     def revoke_sip_browser_session(self, session_id: str) -> dict:
@@ -511,6 +522,75 @@ class StateRepository:
             ).fetchall()
             return [StepCommand.model_validate_json(row["command_json"]) for row in rows]
 
+    def record_verification(
+        self,
+        employee_id: str,
+        target_system: str,
+        source_step_id: str,
+        evidence_hash: str,
+    ) -> None:
+        with self._lock:
+            self._connection.execute(
+                """INSERT INTO verification_records
+                   (employee_id,target_system,source_step_id,evidence_hash,verified_at)
+                   VALUES(?,?,?,?,?)
+                   ON CONFLICT(employee_id,target_system) DO UPDATE SET
+                   source_step_id=excluded.source_step_id,
+                   evidence_hash=excluded.evidence_hash,
+                   verified_at=excluded.verified_at""",
+                (
+                    employee_id,
+                    target_system,
+                    source_step_id,
+                    evidence_hash,
+                    iso(),
+                ),
+            )
+
+    def activation_blockers(self, employee_id: str) -> list[str]:
+        """Return mandatory systems that lack verification of their latest step."""
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT s.command_json FROM steps s
+                   JOIN executions e USING(request_id)
+                   WHERE e.employee_id=? AND s.state IN ('succeeded','verified')
+                   ORDER BY s.updated_at DESC""",
+                (employee_id,),
+            ).fetchall()
+        latest: dict[str, StepCommand] = {}
+        created_disabled: set[str] = set()
+        for row in rows:
+            command = StepCommand.model_validate_json(row["command_json"])
+            if (
+                command.mandatory
+                and command.operation == Operation.CREATE_DISABLED
+            ):
+                created_disabled.add(command.target_system.value)
+            if (
+                command.mandatory
+                and command.operation
+                in {Operation.CREATE_DISABLED, Operation.UPDATE}
+            ):
+                latest.setdefault(command.target_system.value, command)
+        if not latest:
+            return ["created_disabled_account_missing"]
+        with self._lock:
+            verified = {
+                row["target_system"]: row["source_step_id"]
+                for row in self._connection.execute(
+                    """SELECT target_system,source_step_id
+                       FROM verification_records WHERE employee_id=?""",
+                    (employee_id,),
+                ).fetchall()
+            }
+        blockers = []
+        for system, command in latest.items():
+            if system not in created_disabled:
+                blockers.append(f"{system}:created_disabled_missing")
+            if verified.get(system) != command.step_id:
+                blockers.append(f"{system}:verification_missing")
+        return sorted(blockers)
+
     def record_compensation(
         self,
         request_id: str,
@@ -519,14 +599,40 @@ class StateRepository:
         state: str,
         evidence_hash: str | None = None,
         error_code: str | None = None,
+        retry_delay_seconds: int | None = None,
     ):
         with self._lock:
+            existing = self._connection.execute(
+                """SELECT attempt_count FROM compensation_actions
+                   WHERE request_id=? AND step_id=? AND action=?""",
+                (request_id, step_id, action),
+            ).fetchone()
+            attempt_count = (existing["attempt_count"] if existing else 0) + 1
+            retry_at = (
+                iso(
+                    now()
+                    + timedelta(
+                        seconds=min(
+                            retry_delay_seconds * (2 ** (attempt_count - 1)),
+                            300,
+                        )
+                    )
+                )
+                if state == "failed" and retry_delay_seconds is not None
+                else None
+            )
+            timestamp = iso()
             self._connection.execute(
                 """INSERT INTO compensation_actions
-                   (request_id,step_id,action,state,evidence_hash,error_code,created_at)
-                   VALUES(?,?,?,?,?,?,?) ON CONFLICT(request_id,step_id,action)
+                   (request_id,step_id,action,state,evidence_hash,error_code,
+                    attempt_count,max_attempts,next_retry_at,updated_at,created_at)
+                   VALUES(?,?,?,?,?,?,1,3,?,?,?)
+                   ON CONFLICT(request_id,step_id,action)
                    DO UPDATE SET state=excluded.state,evidence_hash=excluded.evidence_hash,
-                     error_code=excluded.error_code""",
+                     error_code=excluded.error_code,
+                     attempt_count=compensation_actions.attempt_count+1,
+                     next_retry_at=excluded.next_retry_at,
+                     updated_at=excluded.updated_at""",
                 (
                     request_id,
                     step_id,
@@ -534,9 +640,22 @@ class StateRepository:
                     state,
                     evidence_hash,
                     error_code,
-                    iso(),
+                    retry_at,
+                    timestamp,
+                    timestamp,
                 ),
             )
+
+    def due_compensation_request_ids(self) -> list[str]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT DISTINCT request_id FROM compensation_actions
+                   WHERE state='failed' AND attempt_count<max_attempts
+                     AND (next_retry_at IS NULL OR next_retry_at<=?)
+                   ORDER BY request_id""",
+                (iso(),),
+            ).fetchall()
+            return [row["request_id"] for row in rows]
 
     def cancel_pending(self, request_id: str) -> int:
         with self._lock:
@@ -670,18 +789,10 @@ class StateRepository:
                 (employee_id,),
             ).fetchall()
         latest: dict[str, StepCommand] = {}
-        canonical: dict[str, StepCommand] = {}
         for row in rows:
             command = StepCommand.model_validate_json(row["command_json"])
-            system = command.target_system.value
-            latest.setdefault(system, command)
-            if command.operation == Operation.CREATE_DISABLED:
-                canonical[system] = command
-        # Lifecycle and browser-session authorization must use the original
-        # successful binding payload. Later suspend/reactivate/terminate steps
-        # commonly carry an intentionally minimal payload and must not erase
-        # provider identifiers, campaigns, roles, or endpoint assignment.
-        return [canonical.get(system, command) for system, command in latest.items()]
+            latest.setdefault(command.target_system.value, command)
+        return list(latest.values())
 
     def accept_jti(self, jti: str, expires_at: int) -> bool:
         with self._lock:

@@ -1,5 +1,10 @@
 FROM python@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
 
+ARG VCS_REF=unreleased
+ARG SOURCE_URL=https://github.com/appolon1908-hue/codestra-provisioning-service
+LABEL org.opencontainers.image.revision=$VCS_REF \
+      org.opencontainers.image.source=$SOURCE_URL
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1

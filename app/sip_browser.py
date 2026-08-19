@@ -28,6 +28,9 @@ class SipBrowserSessionManager:
         repository: StateRepository,
         adapters: dict,
         turn_secret_file: str,
+        *,
+        endpoint: int = 6101,
+        campaign: str = "TEST_SYN",
     ):
         self.repository = repository
         adapter = adapters.get(TargetSystem.SIP.value)
@@ -35,6 +38,8 @@ class SipBrowserSessionManager:
             raise RuntimeError("sip_runtime_adapter_required")
         self.sip_adapter = adapter
         self.turn_secret_file = turn_secret_file
+        self.endpoint = endpoint
+        self.campaign = campaign
 
     def _validated_command(self, request: SipBrowserSessionRequest):
         results = {
@@ -62,6 +67,8 @@ class SipBrowserSessionManager:
             or keycloak.get("attributes", {}).get("role_template") != request.role
             or request.campaign
             not in set(vicidial.get("campaigns", []))
+            or request.endpoint != self.endpoint
+            or request.campaign != self.campaign
         ):
             raise SipBrowserSessionError("identity_authorization_mismatch")
         return commands["sip"]
