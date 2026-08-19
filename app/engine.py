@@ -85,22 +85,39 @@ class ProvisioningEngine:
         if execution.request_id != request_id:
             raise EngineError(422, "request_id_mismatch")
         self._validate_freshness(execution)
+        activation_steps = [
+            step for step in execution.steps if step.operation == Operation.ACTIVATE
+        ]
+        if activation_steps and len(activation_steps) != len(execution.steps):
+            raise EngineError(422, "mixed_activation_execution_forbidden")
         employee_lock = self._employee_locks.setdefault(
             execution.employee_id, asyncio.Lock()
         )
         async with employee_lock:
-            if execution.operation == Operation.ACTIVATE or any(
-                step.operation == Operation.ACTIVATE for step in execution.steps
-            ):
-                blockers = self.repository.activation_blockers(execution.employee_id)
-                if blockers:
-                    raise EngineError(409, "mandatory_verification_incomplete")
             normalized = self._normalize_keys(execution)
+            request_hash = canonical_hash(normalized)
             lock = self._locks.setdefault(request_id, asyncio.Lock())
             async with lock:
                 try:
+                    existing, replayed = self.repository.existing_execution(
+                        normalized, request_hash
+                    )
+                    if replayed:
+                        current = existing or self.repository.request_result(
+                            request_id, replayed=True
+                        )
+                        if current:
+                            return current.model_copy(update={"replayed": True})
+                    if activation_steps:
+                        blockers = self.repository.activation_blockers(
+                            execution.employee_id
+                        )
+                        if blockers:
+                            raise EngineError(
+                                409, "mandatory_verification_incomplete"
+                            )
                     existing, replayed = self.repository.begin_execution(
-                        normalized, canonical_hash(normalized)
+                        normalized, request_hash
                     )
                 except IdempotencyConflict as exc:
                     raise EngineError(409, str(exc)) from exc
@@ -328,6 +345,7 @@ class ProvisioningEngine:
                 current.employee_id, original.target_system.value, original.step_id
             )
             for original in originals
+            if original.mandatory
         ):
             raise EngineError(409, "stale_verification_conflict")
         results = []
@@ -368,11 +386,15 @@ class ProvisioningEngine:
                         )
                     )
                     continue
-                accepted = self.repository.record_verification(
-                    current.employee_id,
-                    command.target_system.value,
-                    original.step_id,
-                    evidence,
+                accepted = (
+                    self.repository.record_verification(
+                        current.employee_id,
+                        command.target_system.value,
+                        original.step_id,
+                        evidence,
+                    )
+                    if original.mandatory
+                    else True
                 )
                 if not accepted:
                     raise EngineError(409, "stale_verification_conflict")

@@ -16,6 +16,16 @@ def test_duplicate_suppression_and_payload_conflict(tmp_path):
         repository.begin_execution(request.model_copy(update={"employee_id": "other"}), "b" * 64)
 
 
+def test_existing_execution_is_read_only_replay_probe(tmp_path):
+    repository = StateRepository(str(tmp_path / "state.db"))
+    request = execution()
+    assert repository.existing_execution(request, "a" * 64) == (None, False)
+    repository.begin_execution(request, "a" * 64)
+    assert repository.existing_execution(request, "a" * 64) == (None, True)
+    with pytest.raises(IdempotencyConflict):
+        repository.existing_execution(request, "b" * 64)
+
+
 def test_atomic_claim_and_restart_recovery(tmp_path):
     repository = StateRepository(str(tmp_path / "state.db"))
     request = execution()

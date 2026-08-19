@@ -312,6 +312,102 @@ async def test_stale_verification_is_reported_as_conflict(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_mixed_update_and_activation_execution_is_rejected(tmp_path):
+    adapter = FakeAdapter()
+    service = engine(tmp_path, adapter)
+    created = execution()
+    await service.submit(created.request_id, created)
+    await service.verify(
+        created.request_id, action(created.request_id, Operation.VERIFY)
+    )
+    mixed = execution(
+        request_id="mixed-activation-0001",
+        employee_id=created.employee_id,
+        key="mixed-activation-idempotency",
+        operation=Operation.UPDATE,
+        steps=2,
+    )
+    mixed = mixed.model_copy(
+        update={
+            "steps": [
+                mixed.steps[0],
+                mixed.steps[1].model_copy(update={"operation": Operation.ACTIVATE}),
+            ]
+        }
+    )
+    with pytest.raises(EngineError) as rejected:
+        await service.submit(mixed.request_id, mixed)
+    assert rejected.value.status_code == 422
+    assert rejected.value.code == "mixed_activation_execution_forbidden"
+    assert service.repository.request_result(mixed.request_id) is None
+
+
+@pytest.mark.asyncio
+async def test_optional_step_does_not_make_mandatory_verification_stale(tmp_path):
+    adapter = FakeAdapter()
+    repository = StateRepository(str(tmp_path / "state.db"))
+    configured = settings(tmp_path)
+    callbacks = CallbackDispatcher(None, configured.callback_hmac_file, repository)
+    service = ProvisioningEngine(
+        {
+            TargetSystem.ODOO.value: adapter,
+            TargetSystem.KEYCLOAK.value: adapter,
+        },
+        repository,
+        configured,
+        callbacks,
+    )
+    request = execution(steps=2)
+    request = request.model_copy(
+        update={
+            "steps": [
+                request.steps[0],
+                request.steps[1].model_copy(
+                    update={"target_system": TargetSystem.KEYCLOAK, "mandatory": False}
+                ),
+            ]
+        }
+    )
+    assert (await service.submit(request.request_id, request)).state == "completed"
+    result = await service.verify(
+        request.request_id, action(request.request_id, Operation.VERIFY)
+    )
+    assert result.state == "verified"
+    record = repository._connection.execute(
+        "SELECT source_step_id FROM verification_records WHERE target_system='odoo'"
+    ).fetchone()
+    assert record["source_step_id"] == request.steps[0].step_id
+
+
+@pytest.mark.asyncio
+async def test_completed_activation_replay_precedes_new_blocker_check(tmp_path):
+    adapter = FakeAdapter()
+    service = engine(tmp_path, adapter)
+    created = execution()
+    await service.submit(created.request_id, created)
+    await service.verify(
+        created.request_id, action(created.request_id, Operation.VERIFY)
+    )
+    activation = execution(
+        request_id="activation-replay-0001",
+        employee_id=created.employee_id,
+        key="activation-replay-idempotency",
+        operation=Operation.ACTIVATE,
+    )
+    assert (await service.submit(activation.request_id, activation)).state == "completed"
+    update = execution(
+        request_id="pending-after-activation-0001",
+        employee_id=created.employee_id,
+        key="pending-after-activation-idempotency",
+        operation=Operation.UPDATE,
+    )
+    service.repository.begin_execution(update, "pending-update-hash")
+    replay = await service.submit(activation.request_id, activation)
+    assert replay.replayed
+    assert replay.state == "completed"
+
+
+@pytest.mark.asyncio
 async def test_update_cannot_substitute_for_create_disabled(tmp_path):
     adapter = FakeAdapter()
     service = engine(tmp_path, adapter)
