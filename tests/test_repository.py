@@ -69,6 +69,12 @@ def test_expired_active_sip_session_does_not_block_replacement(tmp_path):
     repository.create_sip_browser_session(values)
     assert repository.active_sip_browser_session(values["employee_id"]) is None
     assert repository.sip_browser_session(values["session_id"])["state"] == "expired"
+    replacement = {
+        **values,
+        "session_id": "replacement-session",
+        "browser_session_binding": "replacement-binding",
+    }
+    assert repository.create_sip_browser_session(replacement)["state"] == "active"
 
 
 def test_command_views_keep_canonical_binding_and_newest_verification_step(tmp_path):
@@ -135,13 +141,13 @@ def test_old_verification_cannot_replace_newer_evidence(tmp_path):
     )
     repository.begin_execution(update, "b" * 64)
     repository.complete_step(update.steps[0].step_id, StepState.SUCCEEDED, {})
-    repository.record_verification(
+    assert repository.record_verification(
         update.employee_id,
         update.steps[0].target_system.value,
         update.steps[0].step_id,
         "new-evidence",
     )
-    repository.record_verification(
+    assert not repository.record_verification(
         created.employee_id,
         created.steps[0].target_system.value,
         created.steps[0].step_id,

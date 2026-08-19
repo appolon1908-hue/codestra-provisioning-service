@@ -546,30 +546,12 @@ class StateRepository:
         target_system: str,
         source_step_id: str,
         evidence_hash: str,
-    ) -> None:
+    ) -> bool:
         with self._lock:
-            rows = self._connection.execute(
-                """SELECT s.command_json FROM steps s
-                   JOIN executions e USING(request_id)
-                   WHERE e.employee_id=? AND s.state IN ('succeeded','verified')
-                   ORDER BY s.updated_at DESC""",
-                (employee_id,),
-            ).fetchall()
-            current_step_id = next(
-                (
-                    command.step_id
-                    for row in rows
-                    if (command := StepCommand.model_validate_json(row["command_json"]))
-                    .target_system.value
-                    == target_system
-                    and command.mandatory
-                    and command.operation
-                    in {Operation.CREATE_DISABLED, Operation.UPDATE}
-                ),
-                None,
-            )
-            if current_step_id != source_step_id:
-                return
+            if not self._is_current_verification_candidate(
+                employee_id, target_system, source_step_id
+            ):
+                return False
             self._connection.execute(
                 """INSERT INTO verification_records
                    (employee_id,target_system,source_step_id,evidence_hash,verified_at)
@@ -585,6 +567,40 @@ class StateRepository:
                     evidence_hash,
                     iso(),
                 ),
+            )
+            return True
+
+    def _is_current_verification_candidate(
+        self, employee_id: str, target_system: str, source_step_id: str
+    ) -> bool:
+        rows = self._connection.execute(
+            """SELECT s.command_json FROM steps s
+               JOIN executions e USING(request_id)
+               WHERE e.employee_id=? AND s.state IN ('succeeded','verified')
+               ORDER BY s.updated_at DESC""",
+            (employee_id,),
+        ).fetchall()
+        current_step_id = next(
+            (
+                command.step_id
+                for row in rows
+                if (command := StepCommand.model_validate_json(row["command_json"]))
+                .target_system.value
+                == target_system
+                and command.mandatory
+                and command.operation
+                in {Operation.CREATE_DISABLED, Operation.UPDATE}
+            ),
+            None,
+        )
+        return current_step_id == source_step_id
+
+    def is_current_verification_candidate(
+        self, employee_id: str, target_system: str, source_step_id: str
+    ) -> bool:
+        with self._lock:
+            return self._is_current_verification_candidate(
+                employee_id, target_system, source_step_id
             )
 
     def activation_blockers(self, employee_id: str) -> list[str]:

@@ -1,4 +1,5 @@
 import uuid
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -90,3 +91,41 @@ def test_machine_request_cannot_assert_tenant_or_production_mode():
         SipBrowserSessionRequest(**values(tenant_id="OTHER"))
     with pytest.raises(ValidationError):
         SipBrowserSessionRequest(**values(production=True))
+
+
+def test_renew_after_expiration_is_a_controlled_conflict_not_500():
+    class ExpiredRepository(FakeRepository):
+        def __init__(self):
+            self.expired = False
+            self.session = {
+                **values(),
+                "session_id": str(uuid.uuid4()),
+                "state": "active",
+                "expires_at": (
+                    datetime.now(UTC) - timedelta(seconds=1)
+                ).isoformat(),
+            }
+
+        def sip_browser_session(self, session_id):
+            assert session_id == self.session["session_id"]
+            return self.session
+
+        def expire_sip_browser_session(self, session_id):
+            assert session_id == self.session["session_id"]
+            self.expired = True
+            self.session["state"] = "expired"
+            return self.session
+
+    repository = ExpiredRepository()
+    service = SipBrowserSessionManager(
+        repository,
+        {TargetSystem.SIP.value: FakeSipAdapter()},
+        "/unused/turn-secret",
+    )
+    action = SimpleNamespace(
+        session_id=repository.session["session_id"],
+        browser_session_binding=repository.session["browser_session_binding"],
+    )
+    with pytest.raises(SipBrowserSessionError, match="not_active"):
+        service._active(action)
+    assert repository.expired
