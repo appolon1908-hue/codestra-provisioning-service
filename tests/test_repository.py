@@ -97,5 +97,58 @@ def test_command_views_keep_canonical_binding_and_newest_verification_step(tmp_p
     repository.begin_execution(updated, "b" * 64)
     repository.complete_step(updated.steps[0].step_id, StepState.SUCCEEDED, {})
     command = repository.employee_commands(created.employee_id)[0]
-    assert command.operation == Operation.CREATE_DISABLED
-    assert command.payload == {"binding": "canonical"}
+    assert command.operation == Operation.UPDATE
+    assert command.payload == {"binding": "canonical", "partial": True}
+
+
+def test_activation_blocks_incomplete_latest_mandatory_step(tmp_path):
+    repository = StateRepository(str(tmp_path / "state.db"))
+    created = execution()
+    repository.begin_execution(created, "a" * 64)
+    repository.complete_step(created.steps[0].step_id, StepState.SUCCEEDED, {})
+    repository.record_verification(
+        created.employee_id,
+        created.steps[0].target_system.value,
+        created.steps[0].step_id,
+        "evidence-created",
+    )
+    update = execution(
+        request_id="request-00000002",
+        key="idempotency-key-00000002",
+        operation=Operation.UPDATE,
+    )
+    repository.begin_execution(update, "b" * 64)
+    assert "odoo:provisioning_incomplete" in repository.activation_blockers(
+        created.employee_id
+    )
+
+
+def test_old_verification_cannot_replace_newer_evidence(tmp_path):
+    repository = StateRepository(str(tmp_path / "state.db"))
+    created = execution()
+    repository.begin_execution(created, "a" * 64)
+    repository.complete_step(created.steps[0].step_id, StepState.SUCCEEDED, {})
+    update = execution(
+        request_id="request-00000002",
+        key="idempotency-key-00000002",
+        operation=Operation.UPDATE,
+    )
+    repository.begin_execution(update, "b" * 64)
+    repository.complete_step(update.steps[0].step_id, StepState.SUCCEEDED, {})
+    repository.record_verification(
+        update.employee_id,
+        update.steps[0].target_system.value,
+        update.steps[0].step_id,
+        "new-evidence",
+    )
+    repository.record_verification(
+        created.employee_id,
+        created.steps[0].target_system.value,
+        created.steps[0].step_id,
+        "old-evidence",
+    )
+    record = repository._connection.execute(
+        "SELECT source_step_id,evidence_hash FROM verification_records"
+    ).fetchone()
+    assert record["source_step_id"] == update.steps[0].step_id
+    assert record["evidence_hash"] == "new-evidence"
