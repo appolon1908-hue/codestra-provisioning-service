@@ -572,9 +572,49 @@ class StateRepository:
         optional: dict[str, StepCommand] = {}
         for row in rows:
             command = StepCommand.model_validate_json(row["command_json"])
+            if command.operation not in {
+                Operation.CREATE_DISABLED,
+                Operation.UPDATE,
+            }:
+                continue
             selected = mandatory if command.mandatory else optional
             selected.setdefault(command.target_system.value, command)
         return [*mandatory.values(), *optional.values()]
+
+    def compensation_superseded(
+        self, request_id: str, target_system: str
+    ) -> bool:
+        """Return whether later successful employee state makes compensation stale."""
+        with self._lock:
+            source = self._connection.execute(
+                "SELECT employee_id,created_at FROM executions WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if not source:
+                return True
+            rows = self._connection.execute(
+                """SELECT s.command_json FROM steps s
+                   JOIN executions e USING(request_id)
+                   WHERE e.employee_id=? AND e.request_id<>? AND e.created_at>?
+                     AND s.state IN ('succeeded','verified')
+                   ORDER BY s.updated_at DESC""",
+                (source["employee_id"], request_id, source["created_at"]),
+            ).fetchall()
+        state_changing = {
+            Operation.CREATE_DISABLED,
+            Operation.UPDATE,
+            Operation.ACTIVATE,
+            Operation.SUSPEND,
+            Operation.REACTIVATE,
+            Operation.TERMINATE,
+            Operation.ROTATE_CREDENTIALS,
+        }
+        return any(
+            command.target_system.value == target_system
+            and command.operation in state_changing
+            for row in rows
+            if (command := StepCommand.model_validate_json(row["command_json"]))
+        )
 
     def release_activation_claim(self, step_id: str) -> None:
         """Return a claimed activation to retry_wait without consuming an attempt."""

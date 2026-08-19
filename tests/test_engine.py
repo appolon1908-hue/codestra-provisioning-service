@@ -405,6 +405,31 @@ async def test_newer_optional_step_cannot_hide_mandatory_verification(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_later_mandatory_lifecycle_step_cannot_hide_verification_target(tmp_path):
+    adapter = FakeAdapter()
+    service = engine(tmp_path, adapter)
+    request = execution(steps=2)
+    request = request.model_copy(
+        update={
+            "steps": [
+                request.steps[0],
+                request.steps[1].model_copy(update={"operation": Operation.SUSPEND}),
+            ]
+        }
+    )
+    assert (await service.submit(request.request_id, request)).state == "completed"
+    verified = await service.verify(
+        request.request_id, action(request.request_id, Operation.VERIFY)
+    )
+    assert verified.state == "verified"
+    assert len(verified.step_results) == 1
+    record = service.repository._connection.execute(
+        "SELECT source_step_id FROM verification_records WHERE target_system='odoo'"
+    ).fetchone()
+    assert record["source_step_id"] == request.steps[0].step_id
+
+
+@pytest.mark.asyncio
 async def test_activation_retry_rechecks_newer_mandatory_blockers(tmp_path):
     class RetryActivationOnceAdapter(FakeAdapter):
         def __init__(self):
@@ -496,7 +521,12 @@ async def test_due_compensation_serializes_with_new_employee_update(tmp_path):
     adapter.release_update.set()
     await update_task
     await compensation_task
-    assert adapter.call_order[-2:] == ["update_completed", "compensation"]
+    assert adapter.call_order[-1:] == ["update_completed"]
+    compensation = service.repository._connection.execute(
+        "SELECT state,error_code FROM compensation_actions WHERE request_id=?",
+        (original.request_id,),
+    ).fetchone()
+    assert tuple(compensation) == ("superseded", "newer_employee_operation")
 
 
 @pytest.mark.asyncio

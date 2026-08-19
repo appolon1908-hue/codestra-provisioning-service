@@ -276,6 +276,17 @@ class ProvisioningEngine:
                 if original.target_system == TargetSystem.ODOO
                 else Operation.SUSPEND
             )
+            if self.repository.compensation_superseded(
+                request_id, original.target_system.value
+            ):
+                self.repository.record_compensation(
+                    request_id,
+                    original.step_id,
+                    operation.value,
+                    "superseded",
+                    error_code="newer_employee_operation",
+                )
+                continue
             payload = {
                 "compensation": (
                     "remove_excess_access"
