@@ -626,11 +626,12 @@ class StateRepository:
     def release_activation_claim(self, step_id: str) -> None:
         """Return a claimed activation to retry_wait without consuming an attempt."""
         with self._lock:
+            retry_at = iso(now() + timedelta(seconds=30))
             self._connection.execute(
                 """UPDATE steps SET state='retry_wait',attempt_count=MAX(attempt_count-1,0),
                    error_code='mandatory_verification_incomplete',next_retry_at=?,
                    claimed_at=NULL,updated_at=? WHERE step_id=? AND state='running'""",
-                (iso(), iso(), step_id),
+                (retry_at, iso(), step_id),
             )
             self._connection.execute(
                 """UPDATE executions SET state='retry_wait',updated_at=?
