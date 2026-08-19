@@ -410,6 +410,26 @@ class StateRepository:
                 self._connection.execute("ROLLBACK")
                 raise
 
+    def existing_execution(
+        self, execution: RequestExecution, request_hash: str
+    ) -> tuple[ExecutionResult | None, bool]:
+        with self._lock:
+            existing = self._connection.execute(
+                "SELECT request_hash,result_json FROM executions "
+                "WHERE idempotency_hash=?",
+                (digest(execution.idempotency_key),),
+            ).fetchone()
+        if not existing:
+            return None, False
+        if existing["request_hash"] != request_hash:
+            raise IdempotencyConflict("idempotency_payload_conflict")
+        result = (
+            ExecutionResult.model_validate_json(existing["result_json"])
+            if existing["result_json"]
+            else None
+        )
+        return result, True
+
     def claim_next(self, request_id: str) -> StepCommand | None:
         timestamp = iso()
         with self._lock:
