@@ -276,6 +276,35 @@ async def test_activation_requires_verification_for_each_requested_target(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_reactivation_requires_latest_mandatory_verification(tmp_path):
+    adapter = FakeAdapter()
+    service = engine(tmp_path, adapter)
+    created = execution()
+    await service.submit(created.request_id, created)
+    await service.verify(
+        created.request_id, action(created.request_id, Operation.VERIFY)
+    )
+    update = execution(
+        request_id="update-before-reactivation-0001",
+        employee_id=created.employee_id,
+        key="update-before-reactivation-key",
+        operation=Operation.UPDATE,
+    )
+    await service.submit(update.request_id, update)
+    reactivation = execution(
+        request_id="reactivation-with-unverified-update-0001",
+        employee_id=created.employee_id,
+        key="reactivation-with-unverified-update-key",
+        operation=Operation.REACTIVATE,
+    )
+    calls_before = len(adapter.calls)
+    with pytest.raises(EngineError) as denied:
+        await service.submit(reactivation.request_id, reactivation)
+    assert denied.value.code == "mandatory_verification_incomplete"
+    assert len(adapter.calls) == calls_before
+
+
+@pytest.mark.asyncio
 async def test_activation_serializes_against_new_mandatory_employee_update(tmp_path):
     class BlockingUpdateAdapter(FakeAdapter):
         def __init__(self):
