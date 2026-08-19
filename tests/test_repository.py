@@ -179,6 +179,30 @@ def test_credential_rotation_does_not_supersede_access_compensation(tmp_path):
     )
 
 
+def test_retried_request_is_removed_from_due_compensation(tmp_path):
+    repository = StateRepository(str(tmp_path / "state.db"))
+    request = execution()
+    repository.begin_execution(request, "a" * 64)
+    claimed = repository.claim_next(request.request_id)
+    assert claimed is not None
+    repository.fail_step(claimed.step_id, "synthetic", "permanent", None)
+    repository.record_compensation(
+        request.request_id,
+        claimed.step_id,
+        Operation.UPDATE.value,
+        "failed",
+        error_code="compensation_timeout",
+        retry_delay_seconds=0,
+    )
+    assert repository.due_compensation_request_ids() == [request.request_id]
+    assert repository.schedule_step_retry(request.request_id)
+    assert repository.due_compensation_request_ids() == []
+    retried = repository.claim_next(request.request_id)
+    assert retried is not None
+    repository.complete_step(retried.step_id, StepState.SUCCEEDED, {})
+    assert repository.due_compensation_request_ids() == []
+
+
 def test_activation_blocks_incomplete_latest_mandatory_step(tmp_path):
     repository = StateRepository(str(tmp_path / "state.db"))
     created = execution()

@@ -817,10 +817,14 @@ class StateRepository:
     def due_compensation_request_ids(self) -> list[str]:
         with self._lock:
             rows = self._connection.execute(
-                """SELECT DISTINCT request_id FROM compensation_actions
-                   WHERE state='failed' AND attempt_count<max_attempts
-                     AND (next_retry_at IS NULL OR next_retry_at<=?)
-                   ORDER BY request_id""",
+                """SELECT DISTINCT ca.request_id FROM compensation_actions ca
+                   WHERE ca.state='failed' AND ca.attempt_count<ca.max_attempts
+                     AND (ca.next_retry_at IS NULL OR ca.next_retry_at<=?)
+                     AND EXISTS (
+                       SELECT 1 FROM steps s WHERE s.request_id=ca.request_id
+                         AND s.state='dead_letter'
+                     )
+                   ORDER BY ca.request_id""",
                 (iso(),),
             ).fetchall()
             return [row["request_id"] for row in rows]
