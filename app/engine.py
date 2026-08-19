@@ -127,7 +127,7 @@ class ProvisioningEngine:
                     )
                     if current:
                         return current.model_copy(update={"replayed": True})
-                await self._run_request(request_id)
+                await self._run_request(request_id, employee_locked=True)
                 result = self.repository.request_result(request_id)
                 if not result:
                     raise EngineError(500, "execution_state_missing")
@@ -140,23 +140,44 @@ class ProvisioningEngine:
         if action.request_id != request_id or action.operation != Operation.UPDATE:
             raise EngineError(422, "retry_envelope_mismatch")
         self._validate_action_freshness(action)
-        lock = self._locks.setdefault(request_id, asyncio.Lock())
-        async with lock:
-            if not self.repository.schedule_step_retry(request_id):
-                current = self.repository.request_result(request_id, replayed=True)
-                if current:
-                    await self._callback(action, current)
-                    return current
-                raise EngineError(404, "request_not_found")
-            await self._run_request(request_id)
-            result = self.repository.request_result(request_id)
-            if not result:
-                raise EngineError(404, "request_not_found")
-            await self._callback(action, result)
-            return result
+        current = self.repository.request_result(request_id)
+        if not current:
+            raise EngineError(404, "request_not_found")
+        employee_lock = self._employee_locks.setdefault(
+            current.employee_id, asyncio.Lock()
+        )
+        async with employee_lock:
+            lock = self._locks.setdefault(request_id, asyncio.Lock())
+            async with lock:
+                if not self.repository.schedule_step_retry(request_id):
+                    current = self.repository.request_result(request_id, replayed=True)
+                    if current:
+                        await self._callback(action, current)
+                        return current
+                    raise EngineError(404, "request_not_found")
+                await self._run_request(request_id, employee_locked=True)
+                result = self.repository.request_result(request_id)
+                if not result:
+                    raise EngineError(404, "request_not_found")
+                await self._callback(action, result)
+                return result
 
-    async def _run_request(self, request_id: str):
+    async def _run_request(self, request_id: str, employee_locked: bool = False):
+        if not employee_locked:
+            current = self.repository.request_result(request_id)
+            if not current:
+                return
+            employee_lock = self._employee_locks.setdefault(
+                current.employee_id, asyncio.Lock()
+            )
+            async with employee_lock:
+                return await self._run_request(request_id, employee_locked=True)
         while command := self.repository.claim_next(request_id):
+            if command.operation == Operation.ACTIVATE and self.repository.activation_blockers(
+                command.employee_id
+            ):
+                self.repository.release_activation_claim(command.step_id)
+                return
             adapter = self.adapters.get(command.target_system.value)
             if not adapter:
                 state = self.repository.fail_step(
@@ -339,7 +360,7 @@ class ProvisioningEngine:
         action: ActionRequest,
         current: ExecutionResult,
     ) -> ExecutionResult:
-        originals = self.repository.successful_commands(request_id)
+        originals = self.repository.verification_commands(request_id)
         if any(
             not self.repository.is_current_verification_candidate(
                 current.employee_id, original.target_system.value, original.step_id
@@ -561,10 +582,19 @@ class ProvisioningEngine:
     async def worker(self):
         while not self._stopping.is_set():
             for request_id in self.repository.pending_request_ids():
-                lock = self._locks.setdefault(request_id, asyncio.Lock())
-                if not lock.locked():
-                    async with lock:
-                        await self._run_request(request_id)
+                current = self.repository.request_result(request_id)
+                if not current:
+                    continue
+                employee_lock = self._employee_locks.setdefault(
+                    current.employee_id, asyncio.Lock()
+                )
+                if employee_lock.locked():
+                    continue
+                async with employee_lock:
+                    lock = self._locks.setdefault(request_id, asyncio.Lock())
+                    if not lock.locked():
+                        async with lock:
+                            await self._run_request(request_id, employee_locked=True)
             for request_id in self.repository.due_compensation_request_ids():
                 lock = self._locks.setdefault(request_id, asyncio.Lock())
                 if not lock.locked():
