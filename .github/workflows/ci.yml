@@ -36,7 +36,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: aquasecurity/trivy-action@v0.36.0
         with:
-          trivy-version: v0.74.0
+          version: v0.74.0
           image-ref: codestra/provisioning-service:${{ github.sha }}
           format: table
           exit-code: "1"
