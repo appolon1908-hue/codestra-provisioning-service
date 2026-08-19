@@ -262,6 +262,11 @@ class StateRepository:
 
     def active_sip_browser_session(self, employee_id: str) -> dict | None:
         with self._lock:
+            self._connection.execute(
+                """UPDATE sip_browser_sessions SET state='expired',updated_at=?
+                   WHERE employee_id=? AND state='active' AND expires_at<=?""",
+                (iso(), employee_id, iso()),
+            )
             row = self._connection.execute(
                 """SELECT * FROM sip_browser_sessions
                    WHERE employee_id=? AND state='active'""",
@@ -276,6 +281,15 @@ class StateRepository:
                 (session_id,),
             ).fetchone()
             return dict(row) if row else None
+
+    def expire_sip_browser_session(self, session_id: str) -> dict:
+        with self._lock:
+            self._connection.execute(
+                """UPDATE sip_browser_sessions SET state='expired',updated_at=?
+                   WHERE session_id=? AND state='active'""",
+                (iso(), session_id),
+            )
+        return self.sip_browser_session(session_id) or {}
 
     def create_sip_browser_session(self, values: dict[str, Any]) -> dict:
         timestamp = iso()
@@ -520,7 +534,11 @@ class StateRepository:
                    AND state IN ('succeeded','verified') ORDER BY sequence DESC""",
                 (request_id,),
             ).fetchall()
-            return [StepCommand.model_validate_json(row["command_json"]) for row in rows]
+        latest: dict[str, StepCommand] = {}
+        for row in rows:
+            command = StepCommand.model_validate_json(row["command_json"])
+            latest.setdefault(command.target_system.value, command)
+        return list(latest.values())
 
     def record_verification(
         self,
@@ -789,10 +807,13 @@ class StateRepository:
                 (employee_id,),
             ).fetchall()
         latest: dict[str, StepCommand] = {}
+        canonical: dict[str, StepCommand] = {}
         for row in rows:
             command = StepCommand.model_validate_json(row["command_json"])
             latest.setdefault(command.target_system.value, command)
-        return list(latest.values())
+            if command.operation == Operation.CREATE_DISABLED:
+                canonical.setdefault(command.target_system.value, command)
+        return [canonical.get(system, command) for system, command in latest.items()]
 
     def accept_jti(self, jti: str, expires_at: int) -> bool:
         with self._lock:
