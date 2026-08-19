@@ -250,6 +250,17 @@ def test_readiness_rejects_sip_boundary_overrides_and_not_jwks_local_key(tmp_pat
     assert "jwt_public_key_missing" not in errors
 
 
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (("SIP_BROWSER_ENDPOINT", "6102"), ("SIP_BROWSER_CAMPAIGN", "OTHER")),
+)
+def test_runtime_refuses_noncanonical_sip_boundary(monkeypatch, name, value):
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    monkeypatch.setenv(name, value)
+    with pytest.raises(RuntimeError, match="certification boundary invalid"):
+        Settings.load()
+
+
 @pytest.mark.asyncio
 async def test_jwks_lookup_runs_in_worker_thread(tmp_path, monkeypatch):
     private, settings, _, _ = material(tmp_path)

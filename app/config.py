@@ -68,6 +68,17 @@ class Settings:
         environment = os.getenv("ENVIRONMENT", "").strip().lower()
         if environment != "staging":
             raise RuntimeError("service is staging-only")
+        sip_browser_endpoint = int(
+            os.getenv("SIP_BROWSER_ENDPOINT", str(SIP_BROWSER_ENDPOINT))
+        )
+        sip_browser_campaign = os.getenv(
+            "SIP_BROWSER_CAMPAIGN", SIP_BROWSER_CAMPAIGN
+        ).strip()
+        if (
+            sip_browser_endpoint != SIP_BROWSER_ENDPOINT
+            or sip_browser_campaign != SIP_BROWSER_CAMPAIGN
+        ):
+            raise RuntimeError("sip browser certification boundary invalid")
         return cls(
             environment=environment,
             state_database_path=os.getenv(
@@ -129,10 +140,8 @@ class Settings:
             jwt_max_token_ttl_seconds=int(
                 os.getenv("JWT_MAX_TOKEN_TTL_SECONDS", str(MAX_TOKEN_TTL_SECONDS))
             ),
-            sip_browser_endpoint=int(os.getenv("SIP_BROWSER_ENDPOINT", "6101")),
-            sip_browser_campaign=os.getenv(
-                "SIP_BROWSER_CAMPAIGN", "TEST_SYN"
-            ).strip(),
+            sip_browser_endpoint=sip_browser_endpoint,
+            sip_browser_campaign=sip_browser_campaign,
         )
 
     def readiness_errors(self) -> list[str]:
