@@ -356,14 +356,21 @@ class ProvisioningEngine:
         if action.request_id != request_id or action.operation != Operation.CANCEL:
             raise EngineError(422, "cancel_operation_required")
         self._validate_action_freshness(action)
-        if not self.repository.request_result(request_id):
+        current = self.repository.request_result(request_id)
+        if not current:
             raise EngineError(404, "request_not_found")
-        self.repository.cancel_pending(request_id)
-        await self._compensate(request_id)
-        result = self.repository.request_result(request_id)
-        if not result:
-            raise EngineError(500, "execution_state_missing")
-        return result
+        employee_lock = self._employee_locks.setdefault(
+            current.employee_id, asyncio.Lock()
+        )
+        async with employee_lock:
+            lock = self._locks.setdefault(request_id, asyncio.Lock())
+            async with lock:
+                self.repository.cancel_pending(request_id)
+                await self._compensate(request_id)
+                result = self.repository.request_result(request_id)
+                if not result:
+                    raise EngineError(500, "execution_state_missing")
+                return result
 
     async def verify(self, request_id: str, action: ActionRequest) -> ExecutionResult:
         if action.request_id != request_id or action.operation != Operation.VERIFY:
