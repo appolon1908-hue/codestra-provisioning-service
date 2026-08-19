@@ -153,6 +153,8 @@ class ProvisioningEngine:
         current = self.repository.request_result(request_id)
         if not current:
             raise EngineError(404, "request_not_found")
+        if self.repository.is_cancelled(request_id):
+            raise EngineError(409, "cancelled_execution_retry_forbidden")
         employee_lock = self._employee_locks.setdefault(
             current.employee_id, asyncio.Lock()
         )
@@ -410,7 +412,6 @@ class ProvisioningEngine:
                 current.employee_id, original.target_system.value, original.step_id
             )
             for original in originals
-            if original.mandatory
         ):
             raise EngineError(409, "stale_verification_conflict")
         results = []
@@ -451,15 +452,11 @@ class ProvisioningEngine:
                         )
                     )
                     continue
-                accepted = (
-                    self.repository.record_verification(
-                        current.employee_id,
-                        command.target_system.value,
-                        original.step_id,
-                        evidence,
-                    )
-                    if original.mandatory
-                    else True
+                accepted = self.repository.record_verification(
+                    current.employee_id,
+                    command.target_system.value,
+                    original.step_id,
+                    evidence,
                 )
                 if not accepted:
                     raise EngineError(409, "stale_verification_conflict")
