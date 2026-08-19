@@ -634,7 +634,7 @@ class StateRepository:
                 (retry_at, iso(), step_id),
             )
             self._connection.execute(
-                """UPDATE executions SET state='retry_wait',updated_at=?
+                """UPDATE executions SET state='retry_wait',result_json=NULL,updated_at=?
                    WHERE request_id=(SELECT request_id FROM steps WHERE step_id=?)""",
                 (iso(), step_id),
             )

@@ -515,6 +515,10 @@ async def test_activation_retry_rechecks_newer_mandatory_blockers(tmp_path):
     assert retried.step_results[0].retry_at > datetime.now(UTC)
     assert service.repository.claim_next(activation.request_id) is None
     assert len(adapter.calls) == calls_before_retry
+    replay = await service.submit(activation.request_id, activation)
+    assert replay.replayed
+    assert replay.step_results[0].error_code == "mandatory_verification_incomplete"
+    assert replay.step_results[0].retry_at == retried.step_results[0].retry_at
 
 
 @pytest.mark.asyncio
