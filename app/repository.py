@@ -722,6 +722,8 @@ class StateRepository:
         created_disabled: set[str] = set()
         latest_state: dict[str, str] = {}
         for row in rows:
+            if row["state"] == StepState.COMPENSATED:
+                continue
             command = StepCommand.model_validate_json(row["command_json"])
             if (
                 command.operation == Operation.CREATE_DISABLED
