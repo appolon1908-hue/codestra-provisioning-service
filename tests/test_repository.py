@@ -243,6 +243,28 @@ def test_activation_blocks_incomplete_latest_mandatory_step(tmp_path):
     )
 
 
+def test_cancelled_unexecuted_update_does_not_replace_verified_state(tmp_path):
+    repository = StateRepository(str(tmp_path / "state.db"))
+    created = execution()
+    repository.begin_execution(created, "a" * 64)
+    repository.complete_step(created.steps[0].step_id, StepState.SUCCEEDED, {})
+    assert repository.record_verification(
+        created.employee_id,
+        TargetSystem.ODOO.value,
+        created.steps[0].step_id,
+        "created-evidence",
+    )
+    cancelled_update = execution(
+        request_id="cancelled-update-0001",
+        employee_id=created.employee_id,
+        key="cancelled-update-key",
+        operation=Operation.UPDATE,
+    )
+    repository.begin_execution(cancelled_update, "b" * 64)
+    assert repository.cancel_pending(cancelled_update.request_id) == 1
+    assert repository.activation_blockers(created.employee_id) == []
+
+
 def test_old_verification_cannot_replace_newer_evidence(tmp_path):
     repository = StateRepository(str(tmp_path / "state.db"))
     created = execution()
