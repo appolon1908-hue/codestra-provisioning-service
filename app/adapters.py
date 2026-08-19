@@ -428,8 +428,14 @@ class DeterministicMailboxMockAdapter(ProvisioningAdapter):
             )
         except (IdempotencyConflict, ValueError, LookupError) as exc:
             raise PermanentAdapterError(str(exc)) from exc
+        state = row["provisioning_state"]
+        if command.operation == Operation.VERIFY:
+            state = "verified"
+        elif command.operation == Operation.RECONCILE:
+            state = "aligned"
         return {
-            "state": row["provisioning_state"],
+            "state": state,
+            "actual_state": row["provisioning_state"],
             "external_id": row["external_mailbox_id"],
             "external_reference": "deterministic_internal_mock",
             "credential_reference": row["credential_reference"],
@@ -691,6 +697,7 @@ def load_adapters(
         TargetSystem.ODOO: OdooAdapter,
         TargetSystem.AGENT_DESKTOP: AgentDesktopAdapter,
         TargetSystem.EMAIL_PROVIDER: EmailProviderAdapter,
+        TargetSystem.N8N_EVENT: HttpAdapter,
     }
     adapters: dict[str, ProvisioningAdapter] = {}
     keycloak = document.get(TargetSystem.KEYCLOAK.value, {})

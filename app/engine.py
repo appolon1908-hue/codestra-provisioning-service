@@ -84,6 +84,12 @@ class ProvisioningEngine:
         if execution.request_id != request_id:
             raise EngineError(422, "request_id_mismatch")
         self._validate_freshness(execution)
+        if execution.operation == Operation.ACTIVATE or any(
+            step.operation == Operation.ACTIVATE for step in execution.steps
+        ):
+            blockers = self.repository.activation_blockers(execution.employee_id)
+            if blockers:
+                raise EngineError(409, "mandatory_verification_incomplete")
         normalized = self._normalize_keys(execution)
         lock = self._locks.setdefault(request_id, asyncio.Lock())
         async with lock:
@@ -262,6 +268,16 @@ class ProvisioningEngine:
                     operation.value,
                     "failed",
                     error_code=exc.code,
+                    retry_delay_seconds=self.settings.retry_base_seconds,
+                )
+            except Exception:
+                self.repository.record_compensation(
+                    request_id,
+                    original.step_id,
+                    operation.value,
+                    "failed",
+                    error_code="compensation_unclassified_failure",
+                    retry_delay_seconds=self.settings.retry_base_seconds,
                 )
 
     def _validate_action_freshness(self, action: ActionRequest):
@@ -308,6 +324,31 @@ class ProvisioningEngine:
                 evidence = hashlib.sha256(
                     json.dumps(raw, sort_keys=True, default=str).encode()
                 ).hexdigest()
+                verified = (
+                    raw.get("verified") is True
+                    or raw.get("aligned") is True
+                    or raw.get("state") in {"verified", "aligned", "succeeded"}
+                )
+                if not verified:
+                    results.append(
+                        current.step_results[0].model_copy(
+                            update={
+                                "step_id": command.step_id,
+                                "target_system": command.target_system,
+                                "operation": Operation.VERIFY,
+                                "state": StepState.FAILED,
+                                "evidence_hash": evidence,
+                                "error_code": "verification_not_confirmed",
+                            }
+                        )
+                    )
+                    continue
+                self.repository.record_verification(
+                    current.employee_id,
+                    command.target_system.value,
+                    original.step_id,
+                    evidence,
+                )
                 results.append(
                     current.step_results[0].model_copy(
                         update={
@@ -397,16 +438,23 @@ class ProvisioningEngine:
                 evidence = hashlib.sha256(
                     json.dumps(raw, sort_keys=True, default=str).encode()
                 ).hexdigest()
+                aligned = (
+                    raw.get("aligned") is True
+                    or raw.get("state") in {"aligned", "verified"}
+                )
                 results.append(
                     StepResult(
                         step_id=command.step_id,
                         target_system=command.target_system,
                         operation=Operation.RECONCILE,
-                        state=StepState.VERIFIED,
+                        state=(
+                            StepState.VERIFIED if aligned else StepState.FAILED
+                        ),
                         attempt_count=1,
                         external_id=raw.get("external_id"),
                         external_reference=raw.get("external_reference"),
                         evidence_hash=evidence,
+                        error_code=None if aligned else "reconciliation_drift",
                     )
                 )
             except AdapterError as exc:
@@ -458,6 +506,8 @@ class ProvisioningEngine:
         logger.info("restart recovery complete", extra={"fields": {"recovered_steps": recovered}})
         for request_id in self.repository.pending_request_ids():
             await self._run_request(request_id)
+        for request_id in self.repository.due_compensation_request_ids():
+            await self._compensate(request_id)
 
     async def worker(self):
         while not self._stopping.is_set():
@@ -466,6 +516,11 @@ class ProvisioningEngine:
                 if not lock.locked():
                     async with lock:
                         await self._run_request(request_id)
+            for request_id in self.repository.due_compensation_request_ids():
+                lock = self._locks.setdefault(request_id, asyncio.Lock())
+                if not lock.locked():
+                    async with lock:
+                        await self._compensate(request_id)
             await self.callback_dispatcher.dispatch_due()
             try:
                 await asyncio.wait_for(self._stopping.wait(), timeout=1)

@@ -51,7 +51,11 @@ def create_app(
     engine = ProvisioningEngine(loaded_adapters, state, configured, callbacks)
     try:
         sip_browser = SipBrowserSessionManager(
-            state, loaded_adapters, configured.turn_shared_secret_file
+            state,
+            loaded_adapters,
+            configured.turn_shared_secret_file,
+            endpoint=configured.sip_browser_endpoint,
+            campaign=configured.sip_browser_campaign,
         )
     except RuntimeError:
         sip_browser = None
@@ -201,6 +205,7 @@ def create_app(
     verify_auth = require_scope(authorizer, "provisioning:verify")
     cancel_auth = require_scope(authorizer, "provisioning:cancel")
     read_auth = require_scope(authorizer, "provisioning:read")
+    rotate_auth = require_scope(authorizer, "identity:rotate")
     lifecycle_scopes = {
         Operation.SUSPEND: "identity:suspend",
         Operation.REACTIVATE: "identity:reactivate",
@@ -335,9 +340,7 @@ def create_app(
     )
     async def renew_sip_browser_session(
         action: SipBrowserSessionAction,
-        principal: Principal = Depends(
-            require_scope(authorizer, "identity:rotate")
-        ),  # noqa: B008
+        principal: Principal = Depends(rotate_auth),  # noqa: B008
     ):
         del principal
         if sip_browser is None:
@@ -362,9 +365,7 @@ def create_app(
     @api.post("/revoke")
     async def revoke_sip_browser_session(
         action: SipBrowserSessionAction,
-        principal: Principal = Depends(
-            require_scope(authorizer, "identity:rotate")
-        ),  # noqa: B008
+        principal: Principal = Depends(rotate_auth),  # noqa: B008
     ):
         del principal
         if sip_browser is None:
