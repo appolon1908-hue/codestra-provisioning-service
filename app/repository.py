@@ -694,7 +694,9 @@ class StateRepository:
                 employee_id, target_system, source_step_id
             )
 
-    def activation_blockers(self, employee_id: str) -> list[str]:
+    def activation_blockers(
+        self, employee_id: str, required_systems: set[str] | None = None
+    ) -> list[str]:
         """Return mandatory systems that lack verification of their latest step."""
         with self._lock:
             rows = self._connection.execute(
@@ -722,7 +724,7 @@ class StateRepository:
             ):
                 latest.setdefault(command.target_system.value, command)
                 latest_state.setdefault(command.target_system.value, row["state"])
-        if not latest:
+        if not latest and not required_systems:
             return ["created_disabled_account_missing"]
         with self._lock:
             verified = {
@@ -734,7 +736,14 @@ class StateRepository:
                 ).fetchall()
             }
         blockers = []
-        for system, command in latest.items():
+        systems = set(latest)
+        systems.update(required_systems or set())
+        for system in systems:
+            command = latest.get(system)
+            if command is None:
+                blockers.append(f"{system}:created_disabled_missing")
+                blockers.append(f"{system}:verification_missing")
+                continue
             if system not in created_disabled:
                 blockers.append(f"{system}:created_disabled_missing")
             if latest_state[system] not in {"succeeded", "verified"}:

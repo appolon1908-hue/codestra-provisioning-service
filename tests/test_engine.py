@@ -234,6 +234,47 @@ async def test_activation_requires_durable_mandatory_verification(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_activation_requires_verification_for_each_requested_target(tmp_path):
+    adapter = FakeAdapter()
+    repository = StateRepository(str(tmp_path / "state.db"))
+    configured = settings(tmp_path)
+    service = ProvisioningEngine(
+        {
+            TargetSystem.ODOO.value: adapter,
+            TargetSystem.KEYCLOAK.value: adapter,
+        },
+        repository,
+        configured,
+        CallbackDispatcher(None, configured.callback_hmac_file, repository),
+    )
+    created = execution()
+    await service.submit(created.request_id, created)
+    await service.verify(
+        created.request_id, action(created.request_id, Operation.VERIFY)
+    )
+    activation = execution(
+        request_id="unprovisioned-target-activation-0001",
+        employee_id=created.employee_id,
+        key="unprovisioned-target-activation-key",
+        operation=Operation.ACTIVATE,
+    )
+    activation = activation.model_copy(
+        update={
+            "steps": [
+                activation.steps[0].model_copy(
+                    update={"target_system": TargetSystem.KEYCLOAK}
+                )
+            ]
+        }
+    )
+    calls_before = len(adapter.calls)
+    with pytest.raises(EngineError) as denied:
+        await service.submit(activation.request_id, activation)
+    assert denied.value.code == "mandatory_verification_incomplete"
+    assert len(adapter.calls) == calls_before
+
+
+@pytest.mark.asyncio
 async def test_activation_serializes_against_new_mandatory_employee_update(tmp_path):
     class BlockingUpdateAdapter(FakeAdapter):
         def __init__(self):
