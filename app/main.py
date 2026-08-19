@@ -201,15 +201,15 @@ def create_app(
         return Response("\n".join(lines) + "\n", media_type="text/plain")
 
     execute_auth = require_scope(authorizer, "provisioning:execute")
-    retry_auth = require_scope(authorizer, "provisioning:retry")
-    verify_auth = require_scope(authorizer, "provisioning:verify")
-    cancel_auth = require_scope(authorizer, "provisioning:cancel")
+    retry_auth = require_scope(authorizer, "provisioning:execute")
+    verify_auth = require_scope(authorizer, "provisioning:execute")
+    cancel_auth = require_scope(authorizer, "provisioning:execute")
     read_auth = require_scope(authorizer, "provisioning:read")
     rotate_auth = require_scope(authorizer, "identity:rotate")
     lifecycle_scopes = {
-        Operation.SUSPEND: "identity:suspend",
-        Operation.REACTIVATE: "identity:reactivate",
-        Operation.TERMINATE: "identity:terminate",
+        Operation.SUSPEND: "provisioning:execute",
+        Operation.REACTIVATE: "provisioning:execute",
+        Operation.TERMINATE: "provisioning:execute",
         Operation.ROTATE_CREDENTIALS: "identity:rotate",
     }
 
@@ -307,7 +307,7 @@ def create_app(
             response_model=ExecutionResult,
         )
 
-    reconcile_auth = require_scope(authorizer, "identity:reconcile")
+    reconcile_auth = require_scope(authorizer, "provisioning:read")
 
     @api.get(
         "/v1/identities/{employee_id}/reconciliation",

@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,7 +54,10 @@ class JWTAuthorizer:
             if header.get("alg") not in self.settings.jwt_algorithms:
                 raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid_algorithm")
             if self.jwks_client is not None:
-                public_key = self.jwks_client.get_signing_key_from_jwt(token).key
+                signing_key = await asyncio.to_thread(
+                    self.jwks_client.get_signing_key_from_jwt, token
+                )
+                public_key = signing_key.key
             else:
                 public_key = Path(self.settings.jwt_public_key_file).read_text()
             claims = jwt.decode(

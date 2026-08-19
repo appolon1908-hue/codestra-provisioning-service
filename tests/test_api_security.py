@@ -1,10 +1,14 @@
 import time
 import uuid
+from dataclasses import replace
+from types import SimpleNamespace
 
 import jwt
+import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from app.config import (
     CANONICAL_ISSUER,
@@ -18,6 +22,7 @@ from app.config import (
 from app.contracts import TargetSystem
 from app.main import create_app
 from app.repository import StateRepository
+from app.security import JWTAuthorizer
 from tests.helpers import FakeAdapter, execution
 
 
@@ -228,6 +233,44 @@ def test_runtime_defaults_are_the_canonical_machine_contract(monkeypatch):
     assert settings.jwt_allowed_clients == frozenset({MACHINE_CLIENT_ID})
     assert settings.jwt_required_scopes == MACHINE_SCOPES
     assert settings.jwt_max_token_ttl_seconds == MAX_TOKEN_TTL_SECONDS
+
+
+def test_readiness_rejects_sip_boundary_overrides_and_not_jwks_local_key(tmp_path):
+    _, settings, _, _ = material(tmp_path)
+    jwks = replace(
+        settings,
+        jwt_jwks_url="https://auth.codestra.co/realms/codestra/protocol/openid-connect/certs",
+        jwt_public_key_file=str(tmp_path / "absent.pem"),
+        sip_browser_endpoint=6102,
+        sip_browser_campaign="OTHER",
+    )
+    errors = jwks.readiness_errors()
+    assert "sip_browser_endpoint_invalid" in errors
+    assert "sip_browser_campaign_invalid" in errors
+    assert "jwt_public_key_missing" not in errors
+
+
+@pytest.mark.asyncio
+async def test_jwks_lookup_runs_in_worker_thread(tmp_path, monkeypatch):
+    private, settings, _, _ = material(tmp_path)
+    settings = replace(settings, jwt_jwks_url="https://auth.test/jwks")
+    authorizer = JWTAuthorizer(settings, StateRepository(settings.state_database_path))
+    authorizer.jwks_client = SimpleNamespace(
+        get_signing_key_from_jwt=lambda _: SimpleNamespace(key=private.public_key())
+    )
+    calls = []
+
+    async def fake_to_thread(function, *args):
+        calls.append(function)
+        return function(*args)
+
+    monkeypatch.setattr("app.security.asyncio.to_thread", fake_to_thread)
+    request = Request({"type": "http", "query_string": b"", "headers": []})
+    principal = await authorizer.authenticate(
+        request, f"Bearer {token(private, settings)}"
+    )
+    assert principal.client_id == "test-service"
+    assert calls == [authorizer.jwks_client.get_signing_key_from_jwt]
 
 
 def test_required_route_set_is_exact(tmp_path):

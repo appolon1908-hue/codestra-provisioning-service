@@ -10,6 +10,8 @@ MACHINE_SCOPES = frozenset(
     {"identity:rotate", "provisioning:execute", "provisioning:read"}
 )
 MAX_TOKEN_TTL_SECONDS = 300
+SIP_BROWSER_ENDPOINT = 6101
+SIP_BROWSER_CAMPAIGN = "TEST_SYN"
 
 GATES = (
     "PROVISIONING_SERVICE_GATE",
@@ -58,8 +60,8 @@ class Settings:
     jwt_expected_azp: str = MACHINE_CLIENT_ID
     jwt_required_scopes: frozenset[str] = MACHINE_SCOPES
     jwt_max_token_ttl_seconds: int = MAX_TOKEN_TTL_SECONDS
-    sip_browser_endpoint: int = 6101
-    sip_browser_campaign: str = "TEST_SYN"
+    sip_browser_endpoint: int = SIP_BROWSER_ENDPOINT
+    sip_browser_campaign: str = SIP_BROWSER_CAMPAIGN
 
     @classmethod
     def load(cls) -> "Settings":
@@ -153,8 +155,11 @@ class Settings:
             errors.append("jwt_required_scopes_invalid")
         if self.jwt_max_token_ttl_seconds != MAX_TOKEN_TTL_SECONDS:
             errors.append("jwt_max_token_ttl_invalid")
+        if self.sip_browser_endpoint != SIP_BROWSER_ENDPOINT:
+            errors.append("sip_browser_endpoint_invalid")
+        if self.sip_browser_campaign != SIP_BROWSER_CAMPAIGN:
+            errors.append("sip_browser_campaign_invalid")
         for name, path in (
-            ("jwt_public_key", self.jwt_public_key_file),
             ("callback_hmac", self.callback_hmac_file),
             ("encryption_key", self.encryption_key_file),
             ("adapter_config", self.adapter_config_file),
@@ -165,4 +170,6 @@ class Settings:
             candidate = Path(path)
             if not candidate.is_file():
                 errors.append(f"{name}_missing")
+        if not self.jwt_jwks_url and not Path(self.jwt_public_key_file).is_file():
+            errors.append("jwt_public_key_missing")
         return errors
