@@ -571,6 +571,53 @@ async def test_due_compensation_serializes_with_new_employee_update(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_cancel_compensation_serializes_with_new_employee_update(tmp_path):
+    class BlockingUpdateAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.update_started = asyncio.Event()
+            self.release_update = asyncio.Event()
+
+        async def update(self, command):
+            self.calls.append(command)
+            if command.payload.get("compensation"):
+                return {"state": "succeeded", "external_id": "compensated"}
+            self.update_started.set()
+            await self.release_update.wait()
+            return {"state": "succeeded", "external_id": "updated"}
+
+    adapter = BlockingUpdateAdapter()
+    service = engine(tmp_path, adapter)
+    original = execution()
+    await service.submit(original.request_id, original)
+    update = execution(
+        request_id="update-during-cancel-0001",
+        employee_id=original.employee_id,
+        key="update-during-cancel-key",
+        operation=Operation.UPDATE,
+    )
+    update_task = asyncio.create_task(service.submit(update.request_id, update))
+    await adapter.update_started.wait()
+    cancel_task = asyncio.create_task(
+        service.cancel(
+            original.request_id,
+            action(original.request_id, Operation.CANCEL),
+        )
+    )
+    await asyncio.sleep(0)
+    assert not cancel_task.done()
+    adapter.release_update.set()
+    await update_task
+    await cancel_task
+    assert not any(call.payload.get("compensation") for call in adapter.calls)
+    compensation = service.repository._connection.execute(
+        "SELECT state,error_code FROM compensation_actions WHERE request_id=?",
+        (original.request_id,),
+    ).fetchone()
+    assert tuple(compensation) == ("superseded", "newer_employee_operation")
+
+
+@pytest.mark.asyncio
 async def test_completed_activation_replay_precedes_new_blocker_check(tmp_path):
     adapter = FakeAdapter()
     service = engine(tmp_path, adapter)
