@@ -615,7 +615,6 @@ class StateRepository:
             Operation.SUSPEND,
             Operation.REACTIVATE,
             Operation.TERMINATE,
-            Operation.ROTATE_CREDENTIALS,
         }
         return any(
             command.target_system.value == target_system
