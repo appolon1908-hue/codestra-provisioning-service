@@ -85,10 +85,12 @@ class ProvisioningEngine:
         if execution.request_id != request_id:
             raise EngineError(422, "request_id_mismatch")
         self._validate_freshness(execution)
-        activation_steps = [
-            step for step in execution.steps if step.operation == Operation.ACTIVATE
+        access_enabling_steps = [
+            step
+            for step in execution.steps
+            if step.operation in {Operation.ACTIVATE, Operation.REACTIVATE}
         ]
-        if activation_steps and len(activation_steps) != len(execution.steps):
+        if access_enabling_steps and len(access_enabling_steps) != len(execution.steps):
             raise EngineError(422, "mixed_activation_execution_forbidden")
         employee_lock = self._employee_locks.setdefault(
             execution.employee_id, asyncio.Lock()
@@ -108,10 +110,13 @@ class ProvisioningEngine:
                         )
                         if current:
                             return current.model_copy(update={"replayed": True})
-                    if activation_steps:
+                    if access_enabling_steps:
                         blockers = self.repository.activation_blockers(
                             execution.employee_id,
-                            {step.target_system.value for step in activation_steps},
+                            {
+                                step.target_system.value
+                                for step in access_enabling_steps
+                            },
                         )
                         if blockers:
                             raise EngineError(
@@ -174,7 +179,10 @@ class ProvisioningEngine:
             async with employee_lock:
                 return await self._run_request(request_id, employee_locked=True)
         while command := self.repository.claim_next(request_id):
-            if command.operation == Operation.ACTIVATE and self.repository.activation_blockers(
+            if command.operation in {
+                Operation.ACTIVATE,
+                Operation.REACTIVATE,
+            } and self.repository.activation_blockers(
                 command.employee_id, {command.target_system.value}
             ):
                 self.repository.release_activation_claim(command.step_id)
