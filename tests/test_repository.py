@@ -160,6 +160,25 @@ def test_compensation_supersession_uses_successful_mutation_order(tmp_path):
     )
 
 
+def test_credential_rotation_does_not_supersede_access_compensation(tmp_path):
+    repository = StateRepository(str(tmp_path / "state.db"))
+    source = execution()
+    rotation = execution(
+        request_id="credential-rotation-0001",
+        key="credential-rotation-key",
+        operation=Operation.ROTATE_CREDENTIALS,
+    )
+    repository.begin_execution(source, "a" * 64)
+    repository.complete_step(source.steps[0].step_id, StepState.SUCCEEDED, {})
+    repository.begin_execution(rotation, "b" * 64)
+    repository.complete_step(rotation.steps[0].step_id, StepState.SUCCEEDED, {})
+    assert not repository.compensation_superseded(
+        source.request_id,
+        source.steps[0].step_id,
+        TargetSystem.ODOO.value,
+    )
+
+
 def test_activation_blocks_incomplete_latest_mandatory_step(tmp_path):
     repository = StateRepository(str(tmp_path / "state.db"))
     created = execution()
