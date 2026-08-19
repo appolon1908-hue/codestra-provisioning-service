@@ -557,6 +557,12 @@ class StateRepository:
         latest: dict[str, StepCommand] = {}
         for row in rows:
             command = StepCommand.model_validate_json(row["command_json"])
+            if command.operation not in {
+                Operation.CREATE_DISABLED,
+                Operation.UPDATE,
+                Operation.ACTIVATE,
+            }:
+                continue
             latest.setdefault(command.target_system.value, command)
         return list(latest.values())
 
@@ -582,23 +588,25 @@ class StateRepository:
         return [*mandatory.values(), *optional.values()]
 
     def compensation_superseded(
-        self, request_id: str, target_system: str
+        self, request_id: str, source_step_id: str, target_system: str
     ) -> bool:
         """Return whether later successful employee state makes compensation stale."""
         with self._lock:
             source = self._connection.execute(
-                "SELECT employee_id,created_at FROM executions WHERE request_id=?",
-                (request_id,),
+                """SELECT e.employee_id,s.updated_at FROM executions e
+                   JOIN steps s USING(request_id)
+                   WHERE e.request_id=? AND s.step_id=?""",
+                (request_id, source_step_id),
             ).fetchone()
             if not source:
                 return True
             rows = self._connection.execute(
                 """SELECT s.command_json FROM steps s
                    JOIN executions e USING(request_id)
-                   WHERE e.employee_id=? AND e.request_id<>? AND e.created_at>?
+                   WHERE e.employee_id=? AND e.request_id<>? AND s.updated_at>?
                      AND s.state IN ('succeeded','verified')
                    ORDER BY s.updated_at DESC""",
-                (source["employee_id"], request_id, source["created_at"]),
+                (source["employee_id"], request_id, source["updated_at"]),
             ).fetchall()
         state_changing = {
             Operation.CREATE_DISABLED,

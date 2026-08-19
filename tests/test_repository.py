@@ -117,6 +117,49 @@ def test_command_views_keep_canonical_binding_and_newest_verification_step(tmp_p
     assert command.payload == {"binding": "canonical", "partial": True}
 
 
+def test_compensation_view_keeps_latest_compensable_mutation(tmp_path):
+    repository = StateRepository(str(tmp_path / "state.db"))
+    request = execution(steps=2)
+    request = request.model_copy(
+        update={
+            "steps": [
+                request.steps[0],
+                request.steps[1].model_copy(
+                    update={"operation": Operation.ROTATE_CREDENTIALS}
+                ),
+            ]
+        }
+    )
+    repository.begin_execution(request, "a" * 64)
+    for step in request.steps:
+        repository.complete_step(step.step_id, StepState.SUCCEEDED, {})
+    compensable = repository.successful_commands(request.request_id)
+    assert [command.step_id for command in compensable] == [request.steps[0].step_id]
+
+
+def test_compensation_supersession_uses_successful_mutation_order(tmp_path):
+    repository = StateRepository(str(tmp_path / "state.db"))
+    older_request = execution()
+    newer_request = execution(
+        request_id="request-created-later-0001",
+        key="request-created-later-key",
+        operation=Operation.UPDATE,
+    )
+    repository.begin_execution(older_request, "a" * 64)
+    repository.begin_execution(newer_request, "b" * 64)
+    repository.complete_step(
+        newer_request.steps[0].step_id, StepState.SUCCEEDED, {}
+    )
+    repository.complete_step(
+        older_request.steps[0].step_id, StepState.SUCCEEDED, {}
+    )
+    assert not repository.compensation_superseded(
+        older_request.request_id,
+        older_request.steps[0].step_id,
+        TargetSystem.ODOO.value,
+    )
+
+
 def test_activation_blocks_incomplete_latest_mandatory_step(tmp_path):
     repository = StateRepository(str(tmp_path / "state.db"))
     created = execution()

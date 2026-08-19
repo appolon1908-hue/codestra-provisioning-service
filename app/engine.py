@@ -278,7 +278,7 @@ class ProvisioningEngine:
                 else Operation.SUSPEND
             )
             if self.repository.compensation_superseded(
-                request_id, original.target_system.value
+                request_id, original.step_id, original.target_system.value
             ):
                 self.repository.record_compensation(
                     request_id,
