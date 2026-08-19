@@ -323,6 +323,18 @@ class ProvisioningEngine:
                     retry_delay_seconds=self.settings.retry_base_seconds,
                 )
 
+    async def _compensate_due(self, request_id: str):
+        current = self.repository.request_result(request_id)
+        if not current:
+            return
+        employee_lock = self._employee_locks.setdefault(
+            current.employee_id, asyncio.Lock()
+        )
+        async with employee_lock:
+            lock = self._locks.setdefault(request_id, asyncio.Lock())
+            async with lock:
+                await self._compensate(request_id)
+
     def _validate_action_freshness(self, action: ActionRequest):
         age = abs((datetime.now(UTC) - action.timestamp).total_seconds())
         if age > self.settings.request_max_age_seconds:
@@ -577,7 +589,7 @@ class ProvisioningEngine:
         for request_id in self.repository.pending_request_ids():
             await self._run_request(request_id)
         for request_id in self.repository.due_compensation_request_ids():
-            await self._compensate(request_id)
+            await self._compensate_due(request_id)
 
     async def worker(self):
         while not self._stopping.is_set():
@@ -596,10 +608,7 @@ class ProvisioningEngine:
                         async with lock:
                             await self._run_request(request_id, employee_locked=True)
             for request_id in self.repository.due_compensation_request_ids():
-                lock = self._locks.setdefault(request_id, asyncio.Lock())
-                if not lock.locked():
-                    async with lock:
-                        await self._compensate(request_id)
+                await self._compensate_due(request_id)
             await self.callback_dispatcher.dispatch_due()
             try:
                 await asyncio.wait_for(self._stopping.wait(), timeout=1)
