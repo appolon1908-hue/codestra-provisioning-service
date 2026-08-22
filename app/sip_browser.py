@@ -15,6 +15,8 @@ from .contracts import (
 from .repository import StateRepository
 from .secrets import read_secret_file
 
+CANONICAL_BROWSER_WSS_URL = "wss://wss.codestra.agency:8089/ws"
+
 
 class SipBrowserSessionError(RuntimeError):
     pass
@@ -109,7 +111,7 @@ class SipBrowserSessionManager:
             sip_uri=(
                 f"sip:{session['endpoint']}@vicidial-staging.codestra.agency"
             ),
-            approved_wss_url="wss://vicidial-staging.codestra.agency:8089/ws",
+            approved_wss_url=CANONICAL_BROWSER_WSS_URL,
             temporary_turn_username=turn_username,
             temporary_turn_credential=turn_credential,
             approved_turn_url=(

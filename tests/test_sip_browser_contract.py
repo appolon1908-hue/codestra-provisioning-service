@@ -7,7 +7,11 @@ from pydantic import ValidationError
 
 from app.adapters import TelephonyProvisioningAdapter
 from app.contracts import Operation, SipBrowserSessionRequest, TargetSystem
-from app.sip_browser import SipBrowserSessionError, SipBrowserSessionManager
+from app.sip_browser import (
+    CANONICAL_BROWSER_WSS_URL,
+    SipBrowserSessionError,
+    SipBrowserSessionManager,
+)
 
 
 class FakeSipAdapter(TelephonyProvisioningAdapter):
@@ -91,6 +95,10 @@ def test_machine_request_cannot_assert_tenant_or_production_mode():
         SipBrowserSessionRequest(**values(tenant_id="OTHER"))
     with pytest.raises(ValidationError):
         SipBrowserSessionRequest(**values(production=True))
+
+
+def test_browser_signaling_uses_the_canonical_asterisk_wss_origin():
+    assert CANONICAL_BROWSER_WSS_URL == "wss://wss.codestra.agency:8089/ws"
 
 
 def test_renew_after_expiration_is_a_controlled_conflict_not_500():
